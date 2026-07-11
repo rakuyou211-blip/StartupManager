@@ -1,7 +1,22 @@
 # StartupManager
 
-PC起動時に自動起動するソフト/アプリを一覧表示し、**無効化・有効化・完全削除**できる Windows 用 GUI ツールです。
-PowerShell スクリプト1本で動作し、インストール不要です。
+PC起動時に自動起動するソフト/アプリを一覧表示し、**無効化・有効化・完全削除**できるツールです。
+**Windows / macOS 両対応、インストール不要、完全オフライン動作**(インターネット接続不要)。
+
+| OS | 使うファイル | 形式 |
+|---|---|---|
+| Windows 10/11 | `StartupManager.bat` (→ `StartupManager.ps1`) | GUI |
+| macOS | `StartupManager.command` | ターミナル(対話CLI) |
+
+## オフラインについて
+
+- どちらの版も **OS標準のコマンドだけで動作**し、外部との通信や追加ダウンロードは一切ありません
+- ネットを使うのは Windows 版の右クリック「この名前をWebで検索」を自分でクリックしたときだけです(使わなければ通信ゼロ)
+- ZIPをUSBメモリ等で持ち込めば、ネット未接続のPCでもそのまま使えます
+
+---
+
+# Windows 版
 
 ## 対象となる起動項目
 
@@ -78,6 +93,37 @@ powershell -NoProfile -ExecutionPolicy Bypass -File StartupManager.ps1 -SelfTest
 
 - Windows 10 / 11
 - Windows PowerShell 5.1(標準搭載。追加インストール不要)
+
+---
+
+# macOS 版
+
+`StartupManager.command` をダブルクリック(またはターミナルで実行)すると対話メニューが開きます。
+macOS標準の `launchctl` / `PlistBuddy` / `osascript` のみ使用します。
+
+## 対象となる起動項目
+
+| 種類 | 場所 |
+|---|---|
+| エージェント(ユーザー) | `~/Library/LaunchAgents` |
+| エージェント(全体) | `/Library/LaunchAgents` |
+| デーモン | `/Library/LaunchDaemons`(操作にsudo) |
+| ログイン項目 | システム設定の「ログイン項目」(削除のみ対応) |
+
+## 使い方
+
+```
+コマンド: d <番号>=無効化  e <番号>=有効化  r <番号>=削除  b=バックアップ作成  s=復元  l=再表示  q=終了
+```
+
+- 無効化は `launchctl disable`(オーバーライド方式)なので、いつでも有効化で戻せます
+- 削除の前に plist を `Backups/日時/` に自動バックアップし、`s` で書き戻せます
+- 一覧表示のみ: `./StartupManager.command --list`
+
+> 初回ダブルクリック時に「開発元を確認できない」と出る場合は、右クリック→「開く」で起動してください。
+> ログイン項目の列挙には「システムイベント」への許可を求められることがあります。
+
+---
 
 ## 注意事項
 

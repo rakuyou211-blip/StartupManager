@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.6.0 (2026-07-12)
+
+### 追加
+- **macOS対応**: `StartupManager.command` を新規追加。LaunchAgents(ユーザー/全体)・LaunchDaemons・
+  ログイン項目の一覧/無効化/有効化/削除(自動バックアップつき)/復元に対応。
+  macOS標準コマンド(launchctl / PlistBuddy / osascript)のみ使用、bash 3.2互換
+- READMEをWindows/macOS両対応の構成に再編し、完全オフライン動作(通信ゼロ)を明記
+
 ## v1.5.0 (2026-07-12)
 
 ### 追加
