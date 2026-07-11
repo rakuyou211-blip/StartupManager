@@ -10,11 +10,12 @@
 
 param(
     [switch]$List,
-    [string]$Export
+    [string]$Export,
+    [switch]$Backup
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.1.0'
+$script:Version = '1.2.0'
 
 # ============================================================
 # 共通設定
@@ -95,6 +96,8 @@ function Get-RunItems {
 
 function Get-FolderItems {
     $result = @()
+    $sh = $null
+    try { $sh = New-Object -ComObject WScript.Shell } catch {}
     foreach ($src in $script:FolderSources) {
         if (-not $src.Path -or -not (Test-Path $src.Path)) { continue }
         $files = Get-ChildItem -Path $src.Path -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' }
@@ -102,8 +105,8 @@ function Get-FolderItems {
             $state = Get-ApprovedState $src.Approved $f.Name
             $enabled = $true; if ($null -ne $state) { $enabled = $state }
             $target = $f.FullName
-            if ($f.Extension -eq '.lnk') {
-                try { $sh = New-Object -ComObject WScript.Shell; $target = ($sh.CreateShortcut($f.FullName)).TargetPath } catch {}
+            if ($f.Extension -eq '.lnk' -and $sh) {
+                try { $target = ($sh.CreateShortcut($f.FullName)).TargetPath } catch {}
             }
             $result += [pscustomobject]@{
                 Enabled=$enabled; Name=$f.Name; Type=$src.Name; Command=$target;
@@ -224,6 +227,41 @@ function Ensure-SessionBackup {
     return $script:LastBackupDir
 }
 
+# バックアップフォルダの内容を現在の環境に書き戻す
+function Restore-FromBackup {
+    param([string]$Dir)
+    $log = @()
+    # レジストリ (.reg)
+    foreach ($f in (Get-ChildItem -Path $Dir -Filter '*.reg' -File -ErrorAction SilentlyContinue)) {
+        $p = Start-Process reg.exe -ArgumentList 'import', ('"' + $f.FullName + '"') -Wait -PassThru -WindowStyle Hidden
+        if ($p.ExitCode -eq 0) { $log += "OK: $($f.Name)" }
+        else { $log += "失敗: $($f.Name) (HKLM側は管理者権限が必要です)" }
+    }
+    # スタートアップフォルダ
+    $map = @{
+        'User_StartupFolder'    = [Environment]::GetFolderPath('Startup')
+        'Machine_StartupFolder' = [Environment]::GetFolderPath('CommonStartup')
+    }
+    foreach ($k in $map.Keys) {
+        $src = Join-Path $Dir $k
+        if (-not (Test-Path $src) -or -not $map[$k]) { continue }
+        foreach ($f in (Get-ChildItem -Path $src -File -ErrorAction SilentlyContinue)) {
+            try { Copy-Item -LiteralPath $f.FullName -Destination $map[$k] -Force; $log += "OK: $k\$($f.Name)" }
+            catch { $log += "失敗: $($f.Name) : $($_.Exception.Message)" }
+        }
+    }
+    # タスク (削除時に書き出したXML)
+    foreach ($f in (Get-ChildItem -Path $Dir -Filter 'task_*.xml' -File -ErrorAction SilentlyContinue)) {
+        $name = $f.BaseName.Substring(5)
+        try {
+            Register-ScheduledTask -TaskName $name -Xml (Get-Content -LiteralPath $f.FullName -Raw) -Force | Out-Null
+            $log += "OK: タスク $name"
+        } catch { $log += "失敗: タスク $name : $($_.Exception.Message)" }
+    }
+    if ($log.Count -eq 0) { $log = @('復元対象が見つかりませんでした。') }
+    return $log
+}
+
 # ============================================================
 # 状態変更 / 削除
 # ============================================================
@@ -282,6 +320,12 @@ if ($Export) {
     return
 }
 
+if ($Backup) {
+    $dir = New-FullBackup
+    Write-Output ("バックアップを作成しました: {0}" -f $dir)
+    return
+}
+
 # ============================================================
 # GUI
 # ============================================================
@@ -300,9 +344,10 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "StartupManager v$($script:Version) - 起動時に自動起動するソフトの管理"
-$form.Size = New-Object System.Drawing.Size(960, 620)
+$form.Size = New-Object System.Drawing.Size(1000, 620)
 $form.StartPosition = 'CenterScreen'
-$form.MinimumSize = New-Object System.Drawing.Size(760, 460)
+$form.MinimumSize = New-Object System.Drawing.Size(920, 480)
+try { $form.Font = New-Object System.Drawing.Font('Meiryo UI', 9) } catch {}
 
 # --- 上部: 検索 / オプション ---
 $lblSearch = New-Object System.Windows.Forms.Label
@@ -334,16 +379,17 @@ $form.Controls.Add($lblAdmin)
 # --- 一覧 ---
 $lv = New-Object System.Windows.Forms.ListView
 $lv.Location = New-Object System.Drawing.Point(12, 45)
-$lv.Size = New-Object System.Drawing.Size(920, 470)
+$lv.Size = New-Object System.Drawing.Size(960, 455)
 $lv.View = 'Details'
 $lv.FullRowSelect = $true
 $lv.GridLines = $true
 $lv.MultiSelect = $true
 $lv.Anchor = 'Top,Bottom,Left,Right'
 [void]$lv.Columns.Add('状態', 60)
-[void]$lv.Columns.Add('名前', 230)
-[void]$lv.Columns.Add('種類', 170)
-[void]$lv.Columns.Add('コマンド / パス', 440)
+[void]$lv.Columns.Add('名前', 220)
+[void]$lv.Columns.Add('種類', 160)
+[void]$lv.Columns.Add('発行元', 150)
+[void]$lv.Columns.Add('コマンド / パス', 350)
 $form.Controls.Add($lv)
 
 # 列クリックソートの状態 (-1 = 既定ソート: 無効を先頭 → 分類 → 名前)
@@ -352,8 +398,8 @@ $script:SortAsc = $true
 
 # --- 下部ボタン ---
 $panel = New-Object System.Windows.Forms.FlowLayoutPanel
-$panel.Location = New-Object System.Drawing.Point(12, 525)
-$panel.Size = New-Object System.Drawing.Size(920, 50)
+$panel.Location = New-Object System.Drawing.Point(12, 508)
+$panel.Size = New-Object System.Drawing.Size(960, 40)
 $panel.Anchor = 'Bottom,Left,Right'
 $form.Controls.Add($panel)
 
@@ -368,28 +414,72 @@ function New-Btn($text, $w) {
 $btnRefresh = New-Btn '更新' 70
 $btnEnable  = New-Btn '有効化' 90
 $btnDisable = New-Btn '無効化' 90
-$btnRemove  = New-Btn '完全削除' 110
+$btnRemove  = New-Btn '完全削除' 100
 $btnBackup  = New-Btn 'バックアップ作成' 140
-$btnOpen    = New-Btn '保存場所を開く' 130
+$btnRestore = New-Btn '復元...' 80
+$btnOpen    = New-Btn '保存場所を開く' 120
 $btnCsv     = New-Btn 'CSV出力' 90
-$panel.Controls.AddRange(@($btnRefresh,$btnEnable,$btnDisable,$btnRemove,$btnBackup,$btnOpen,$btnCsv))
+$panel.Controls.AddRange(@($btnRefresh,$btnEnable,$btnDisable,$btnRemove,$btnBackup,$btnRestore,$btnOpen,$btnCsv))
 
-$status = New-Object System.Windows.Forms.Label
-$status.AutoSize = $true
-$status.Margin = New-Object System.Windows.Forms.Padding(12,9,0,0)
-$panel.Controls.Add($status)
+# --- ステータスバー (件数表示。ボタン列と分離して隠れないように) ---
+$statusStrip = New-Object System.Windows.Forms.StatusStrip
+$status = New-Object System.Windows.Forms.ToolStripStatusLabel
+[void]$statusStrip.Items.Add($status)
+$form.Controls.Add($statusStrip)
 
-# --- 一覧の再描画 ---
+# --- 項目キャッシュ ---
+# 再列挙(タスクスケジューラ照会など)は重いので、検索のたびには行わずキャッシュから描画する。
+$script:CachedItems = @()
+$script:PubCache = @{}   # 実行ファイルパス → 発行元 のキャッシュ
+
+function Reload-Items {
+    $items = @()
+    try { $items = Get-AllStartupItems -IncludeSystemTasks ($chkSystem.Checked) } catch {}
+    foreach ($it in $items) {
+        $seg = ([string]$it.Command -split ' \| ')[0]
+        $exe = Get-ExecutablePath $seg
+        $missing = $false
+        if (-not $exe -and $seg.Trim()) {
+            # 先頭トークンを取り出して判定 (引用符/環境変数/PATH解決に対応)
+            $first = $seg.Trim()
+            if ($first.StartsWith('"')) {
+                $q = $first.IndexOf('"', 1)
+                if ($q -gt 1) { $first = $first.Substring(1, $q - 1) }
+            } else {
+                $first = ($first -split ' ')[0]
+            }
+            $first = [Environment]::ExpandEnvironmentVariables($first)
+            if ($first -and $first.Contains('\')) {
+                if (Test-Path -LiteralPath $first) { $exe = $first } else { $missing = $true }
+            } elseif ($first) {
+                try { $exe = (Get-Command $first -ErrorAction Stop).Source } catch {}
+            }
+        }
+        $pub = ''
+        if ($exe) {
+            if ($script:PubCache.ContainsKey($exe)) { $pub = $script:PubCache[$exe] }
+            else {
+                try { $pub = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe).CompanyName } catch {}
+                if (-not $pub) { $pub = '' }
+                $script:PubCache[$exe] = $pub
+            }
+        }
+        $it | Add-Member -NotePropertyName ExePath   -NotePropertyValue $exe     -Force
+        $it | Add-Member -NotePropertyName Publisher -NotePropertyValue $pub     -Force
+        $it | Add-Member -NotePropertyName Missing   -NotePropertyValue $missing -Force
+    }
+    $script:CachedItems = @($items)
+}
+
+# --- 一覧の再描画 (キャッシュから) ---
 function Refresh-List {
     $lv.BeginUpdate()
     $lv.Items.Clear()
-    $items = @()
-    try { $items = Get-AllStartupItems -IncludeSystemTasks ($chkSystem.Checked) } catch {}
     $filter = $txtSearch.Text.Trim()
 
-    $visible = @($items | Where-Object {
+    $visible = @($script:CachedItems | Where-Object {
         if ($filter -eq '') { return $true }
-        $hay = ($_.Name + ' ' + $_.Type + ' ' + $_.Command)
+        $hay = ($_.Name + ' ' + $_.Type + ' ' + $_.Publisher + ' ' + $_.Command)
         $hay.IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0
     })
 
@@ -398,7 +488,8 @@ function Refresh-List {
         0 { $sorted = $visible | Sort-Object Enabled, Name }
         1 { $sorted = $visible | Sort-Object Name }
         2 { $sorted = $visible | Sort-Object Type, Name }
-        3 { $sorted = $visible | Sort-Object Command }
+        3 { $sorted = $visible | Sort-Object Publisher, Name }
+        4 { $sorted = $visible | Sort-Object Command }
         default { $sorted = $visible | Sort-Object @{E={ -not $_.Enabled }}, Kind, Name }
     }
     $sorted = @($sorted)
@@ -406,18 +497,31 @@ function Refresh-List {
 
     foreach ($it in $sorted) {
         $statusText = '有効'; if (-not $it.Enabled) { $statusText = '無効' }
+        $pubText = [string]$it.Publisher
+        if ($it.Missing) { $pubText = '(ファイルが見つかりません)' }
         $lvi = New-Object System.Windows.Forms.ListViewItem($statusText)
         [void]$lvi.SubItems.Add([string]$it.Name)
         [void]$lvi.SubItems.Add([string]$it.Type)
+        [void]$lvi.SubItems.Add($pubText)
         [void]$lvi.SubItems.Add([string]$it.Command)
-        if (-not $it.Enabled) { $lvi.ForeColor = [System.Drawing.Color]::Gray }
+        if ($it.Missing) { $lvi.ForeColor = [System.Drawing.Color]::Firebrick }
+        elseif (-not $it.Enabled) { $lvi.ForeColor = [System.Drawing.Color]::Gray }
         $lvi.Tag = $it
         [void]$lv.Items.Add($lvi)
     }
     $lv.EndUpdate()
 
     $disabled = @($visible | Where-Object { -not $_.Enabled }).Count
-    $status.Text = ('{0} 件を表示中 (有効 {1} / 無効 {2})' -f @($visible).Count, (@($visible).Count - $disabled), $disabled)
+    $broken = @($visible | Where-Object { $_.Missing }).Count
+    $text = '{0} 件を表示中 (有効 {1} / 無効 {2}' -f @($visible).Count, (@($visible).Count - $disabled), $disabled
+    if ($broken -gt 0) { $text += " / リンク切れ $broken" }
+    $status.Text = $text + ')'
+}
+
+# 再列挙 + 再描画 (状態変更・削除・更新ボタン用)
+function Update-List {
+    Reload-Items
+    Refresh-List
 }
 
 function Get-SelectedItems {
@@ -442,7 +546,7 @@ function Invoke-OnSelection {
         $msg = "一部の項目で失敗しました（管理者権限が必要な場合があります）:`r`n`r`n" + ($fail -join "`r`n")
         [System.Windows.Forms.MessageBox]::Show($msg, $Verb) | Out-Null
     }
-    Refresh-List
+    Update-List
     return $true
 }
 
@@ -452,6 +556,7 @@ $miEnable  = $ctx.Items.Add('有効化')
 $miDisable = $ctx.Items.Add('無効化')
 [void]$ctx.Items.Add('-')
 $miOpenLoc = $ctx.Items.Add('ファイルの場所を開く')
+$miOpenSrc = $ctx.Items.Add('定義元を開く (レジストリ/タスク/フォルダ)')
 $miCopyCmd = $ctx.Items.Add('コマンドをコピー')
 $miDetail  = $ctx.Items.Add('詳細を表示')
 [void]$ctx.Items.Add('-')
@@ -459,12 +564,12 @@ $miRemove  = $ctx.Items.Add('完全削除...')
 $lv.ContextMenuStrip = $ctx
 $ctx.Add_Opening({
     $has = ($lv.SelectedItems.Count -gt 0)
-    foreach ($mi in @($miEnable,$miDisable,$miOpenLoc,$miCopyCmd,$miDetail,$miRemove)) { $mi.Enabled = $has }
+    foreach ($mi in @($miEnable,$miDisable,$miOpenLoc,$miOpenSrc,$miCopyCmd,$miDetail,$miRemove)) { $mi.Enabled = $has }
 })
 
 function Show-ItemDetail {
     param($it)
-    $exe = Get-ExecutablePath $it.Command
+    $exe = $it.ExePath
     $lines = @(
         "名前: $($it.Name)"
         "種類: $($it.Type)"
@@ -472,12 +577,18 @@ function Show-ItemDetail {
         "範囲: $(if ($it.Scope -eq 'Machine') {'全ユーザー'} else {'現在のユーザー'})"
         "コマンド: $($it.Command)"
     )
+    if ($it.Missing) { $lines += "⚠ 実行ファイルが見つかりません (リンク切れ。削除候補です)" }
     if ($exe) {
         $lines += "実行ファイル: $exe"
         try {
             $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
             if ($vi.CompanyName)    { $lines += "発行元: $($vi.CompanyName)" }
             if ($vi.FileDescription){ $lines += "説明: $($vi.FileDescription)" }
+            if ($vi.FileVersion)    { $lines += "バージョン: $($vi.FileVersion)" }
+        } catch {}
+        try {
+            $sig = Get-AuthenticodeSignature -LiteralPath $exe -ErrorAction Stop
+            $lines += "署名: $(if ($sig.Status -eq 'Valid') { '有効 (' + $sig.SignerCertificate.Subject.Split(',')[0] + ')' } elseif ($sig.Status -eq 'NotSigned') { 'なし' } else { [string]$sig.Status })"
         } catch {}
     }
     if ($it.Kind -eq 'Run')    { $lines += "レジストリ: $($it.RegRoot)" }
@@ -490,14 +601,31 @@ function Open-ItemLocation {
     param($it)
     $target = $null
     if ($it.Kind -eq 'Folder' -and $it.FilePath -and (Test-Path -LiteralPath $it.FilePath)) { $target = $it.FilePath }
-    else { $target = Get-ExecutablePath $it.Command }
+    elseif ($it.ExePath) { $target = $it.ExePath }
     if ($target) { Start-Process explorer.exe "/select,`"$target`"" }
     else { [System.Windows.Forms.MessageBox]::Show('実行ファイルの場所を特定できませんでした。', 'ファイルの場所を開く') | Out-Null }
+}
+
+# 定義元 (レジストリ / タスクスケジューラ / フォルダ) をそれぞれのツールで開く
+function Open-ItemSource {
+    param($it)
+    switch ($it.Kind) {
+        'Run' {
+            $full = $it.RegRoot -replace '^HKCU', 'HKEY_CURRENT_USER' -replace '^HKLM', 'HKEY_LOCAL_MACHINE'
+            $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Applets\Regedit'
+            if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }
+            New-ItemProperty -Path $k -Name LastKey -Value ("Computer\" + $full) -PropertyType String -Force | Out-Null
+            Start-Process regedit.exe
+        }
+        'Folder' { if ($it.FolderPath) { Start-Process explorer.exe $it.FolderPath } }
+        'Task'   { Start-Process taskschd.msc }
+    }
 }
 
 $miEnable.Add_Click({  Invoke-OnSelection -Verb '有効化' -Action { param($it) Set-ItemState -Item $it -Enable $true }  | Out-Null })
 $miDisable.Add_Click({ Invoke-OnSelection -Verb '無効化' -Action { param($it) Set-ItemState -Item $it -Enable $false } | Out-Null })
 $miOpenLoc.Add_Click({ $sel = Get-SelectedItems; if ($sel.Count -gt 0) { Open-ItemLocation $sel[0] } })
+$miOpenSrc.Add_Click({ $sel = Get-SelectedItems; if ($sel.Count -gt 0) { Open-ItemSource $sel[0] } })
 $miCopyCmd.Add_Click({
     $sel = Get-SelectedItems
     if ($sel.Count -gt 0) {
@@ -518,9 +646,35 @@ $lv.Add_ColumnClick({
     Refresh-List
 })
 
+# キーボードショートカット: F5=更新, Ctrl+A=全選択, Delete=無効化, Enter=詳細
+$lv.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::F5) { Update-List; $e.Handled = $true }
+    elseif ($e.Control -and $e.KeyCode -eq [System.Windows.Forms.Keys]::A) {
+        foreach ($i in $lv.Items) { $i.Selected = $true }
+        $e.Handled = $true
+    }
+    elseif ($e.KeyCode -eq [System.Windows.Forms.Keys]::Delete) {
+        if ($lv.SelectedItems.Count -gt 0) {
+            Invoke-OnSelection -Verb '無効化' -Action { param($it) Set-ItemState -Item $it -Enable $false } | Out-Null
+        }
+        $e.Handled = $true
+    }
+    elseif ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+        $sel = Get-SelectedItems; if ($sel.Count -gt 0) { Show-ItemDetail $sel[0] }
+        $e.Handled = $true
+    }
+})
+
+# Escで検索クリア
+$txtSearch.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $txtSearch.Clear(); $e.Handled = $true }
+})
+
 # --- イベント ---
-$btnRefresh.Add_Click({ Refresh-List })
-$chkSystem.Add_CheckedChanged({ Refresh-List })
+$btnRefresh.Add_Click({ Update-List })
+$chkSystem.Add_CheckedChanged({ Update-List })
 $txtSearch.Add_TextChanged({ Refresh-List })
 
 $btnEnable.Add_Click({
@@ -561,6 +715,58 @@ $btnOpen.Add_Click({
     Start-Process explorer.exe $script:BackupRoot
 })
 
+$btnRestore.Add_Click({
+    if (-not (Test-Path $script:BackupRoot)) {
+        [System.Windows.Forms.MessageBox]::Show('バックアップがまだありません。', '復元') | Out-Null; return
+    }
+    $dirs = @(Get-ChildItem -Path $script:BackupRoot -Directory | Sort-Object Name -Descending)
+    if ($dirs.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('バックアップがまだありません。', '復元') | Out-Null; return
+    }
+
+    # バックアップ選択ダイアログ
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = '復元するバックアップを選択'
+    $dlg.Size = New-Object System.Drawing.Size(360, 380)
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $lst = New-Object System.Windows.Forms.ListBox
+    $lst.Location = New-Object System.Drawing.Point(12, 12)
+    $lst.Size = New-Object System.Drawing.Size(320, 260)
+    foreach ($d in $dirs) {
+        # フォルダ名 yyyyMMdd_HHmmss を読みやすく表示
+        $label = $d.Name
+        if ($d.Name -match '^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$') {
+            $label = '{0}/{1}/{2} {3}:{4}:{5}' -f $Matches[1],$Matches[2],$Matches[3],$Matches[4],$Matches[5],$Matches[6]
+        }
+        [void]$lst.Items.Add($label)
+    }
+    $lst.SelectedIndex = 0
+    $dlg.Controls.Add($lst)
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = '復元'; $ok.DialogResult = 'OK'
+    $ok.Location = New-Object System.Drawing.Point(160, 290); $ok.Size = New-Object System.Drawing.Size(80, 30)
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'キャンセル'; $cancel.DialogResult = 'Cancel'
+    $cancel.Location = New-Object System.Drawing.Point(250, 290); $cancel.Size = New-Object System.Drawing.Size(82, 30)
+    $dlg.Controls.AddRange(@($ok, $cancel))
+    $dlg.AcceptButton = $ok; $dlg.CancelButton = $cancel
+    if ($dlg.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK -or $lst.SelectedIndex -lt 0) { return }
+    $target = $dirs[$lst.SelectedIndex]
+
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "バックアップ「$($lst.SelectedItem)」の内容を書き戻します。`r`n現在の起動項目の設定は上書きされます。`r`n`r`nよろしいですか?",
+        '復元の確認',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    $log = Restore-FromBackup -Dir $target.FullName
+    Update-List
+    [System.Windows.Forms.MessageBox]::Show(("復元結果:`r`n`r`n" + ($log -join "`r`n")), '復元') | Out-Null
+})
+
 $btnCsv.Add_Click({
     $dlg = New-Object System.Windows.Forms.SaveFileDialog
     $dlg.Filter = 'CSVファイル (*.csv)|*.csv'
@@ -575,5 +781,5 @@ $btnCsv.Add_Click({
     }
 })
 
-Refresh-List
+Update-List
 [void]$form.ShowDialog()
