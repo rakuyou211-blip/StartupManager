@@ -1,0 +1,10 @@
+# 改行コードの固定 (OSをまたいだcheckoutで壊れないように)
+* text=auto
+
+# Windows用スクリプトはCRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# macOS/Unix用スクリプトはLF (CRLFだとshebangが壊れて動かない)
+*.command text eol=lf
+*.sh text eol=lf
