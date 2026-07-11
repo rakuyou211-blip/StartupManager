@@ -68,7 +68,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File StartupManager.ps1 -SelfTest
 - ダブルクリックで詳細表示(実行ファイルのパス・発行元・バージョン・**デジタル署名の有無**など)
 - CSV エクスポート(GUI / コマンドライン両対応)
 - システムタスク(`\Microsoft\` 配下)の表示切替
-- キーボードショートカット: `F5` 更新 / `Ctrl+A` 全選択 / `Delete` 無効化 / `Enter` 詳細 / `Esc` 検索クリア
+- キーボードショートカット: `F5` 更新 / `Ctrl+A` 全選択 / `Delete` 無効化 / `Enter` 詳細 / `Esc` 検索クリア / `F1` ヘルプ
 - 行にマウスを乗せるとフルコマンドをツールチップ表示
 - 詳細に無効化した日時を表示(タスクマネージャーで無効化したものも判別可能)
 - 右クリック「この名前をWebで検索」で正体不明の項目をすぐ調べられる
@@ -118,7 +118,8 @@ macOS標準の `launchctl` / `PlistBuddy` / `osascript` のみ使用します。
 
 - 無効化は `launchctl disable`(オーバーライド方式)なので、いつでも有効化で戻せます
 - 削除の前に plist を `Backups/日時/` に自動バックアップし、`s` で書き戻せます
-- 一覧表示のみ: `./StartupManager.command --list`
+- コマンドラインオプション: `--list`(一覧のみ) / `--export out.csv`(CSV出力) / `--backup` / `--selftest`(動作セルフテスト)
+- ZIPから展開した場合など、ダブルクリックで開けないときは一度 `chmod +x StartupManager.command` を実行してください
 
 > 初回ダブルクリック時に「開発元を確認できない」と出る場合は、右クリック→「開く」で起動してください。
 > ログイン項目の列挙には「システムイベント」への許可を求められることがあります。

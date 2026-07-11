@@ -7,11 +7,14 @@
 #
 # 使い方:
 #   ダブルクリック (ターミナルが開きます) または  ./StartupManager.command
-#   ./StartupManager.command --list   (一覧表示のみ)
+#   ./StartupManager.command --list             (一覧表示のみ)
+#   ./StartupManager.command --export out.csv   (CSV出力)
+#   ./StartupManager.command --backup           (バックアップのみ作成)
+#   ./StartupManager.command --selftest         (動作セルフテスト)
 #
 set -u
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKUP_ROOT="$SCRIPT_DIR/Backups"
 PLISTBUDDY="/usr/libexec/PlistBuddy"
@@ -164,6 +167,84 @@ restore_menu() {
 }
 
 # ============================================================
+# CSVエクスポート
+# ============================================================
+csv_escape() {
+    local s="${1//\"/\"\"}"
+    printf '"%s"' "$s"
+}
+
+export_csv() {
+    local out="$1" i
+    {
+        printf '状態,名前,種類,プログラム,パス\n'
+        i=0
+        while [ $i -lt ${#ITEM_LABEL[@]} ]; do
+            printf '%s,%s,%s,%s,%s\n' \
+                "$(csv_escape "${ITEM_STATE[$i]}")" \
+                "$(csv_escape "${ITEM_LABEL[$i]}")" \
+                "$(csv_escape "$(type_name "${ITEM_TYPE[$i]}")")" \
+                "$(csv_escape "${ITEM_PROG[$i]}")" \
+                "$(csv_escape "${ITEM_PATH[$i]}")"
+            i=$((i+1))
+        done
+    } > "$out"
+    echo "${#ITEM_LABEL[@]} 件を書き出しました: $out"
+}
+
+# ============================================================
+# セルフテスト (システムの実項目には一切触れない)
+# ============================================================
+ST_FAILS=0
+st_assert() {
+    # $1=直前コマンドの終了コード扱い(0=成功) $2=ラベル
+    if [ "$1" -eq 0 ]; then echo "PASS: $2"; else echo "FAIL: $2"; ST_FAILS=$((ST_FAILS+1)); fi
+}
+
+run_selftest() {
+    echo "== StartupManager for macOS v$VERSION セルフテスト =="
+    local idx tmp dir tmpcsv rc
+
+    # 番号→インデックス変換
+    ITEM_LABEL=(a b c); ITEM_PATH=("" "" ""); ITEM_TYPE=(UserAgent UserAgent UserAgent)
+    ITEM_DOMAIN=("" "" ""); ITEM_STATE=("有効" "有効" "有効"); ITEM_PROG=("" "" "")
+    idx="$(pick_index 2)"; [ "$idx" = "1" ]; st_assert $? "番号からインデックスへの変換"
+    pick_index 0 >/dev/null 2>&1; rc=$?; [ $rc -ne 0 ]; st_assert $? "範囲外の番号(0)を拒否"
+    pick_index abc >/dev/null 2>&1; rc=$?; [ $rc -ne 0 ]; st_assert $? "数字以外の入力を拒否"
+    pick_index 4 >/dev/null 2>&1; rc=$?; [ $rc -ne 0 ]; st_assert $? "範囲外の番号(上限超え)を拒否"
+
+    # plistの列挙 (一時フォルダ内のダミーで検証)
+    tmp="$(mktemp -d 2>/dev/null || mktemp -d -t smtest)"
+    cat > "$tmp/com.example.selftest.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>com.example.selftest</string></dict></plist>
+PLIST
+    ITEM_LABEL=(); ITEM_PATH=(); ITEM_TYPE=(); ITEM_DOMAIN=(); ITEM_STATE=(); ITEM_PROG=()
+    add_plist_dir "$tmp" "UserAgent" "gui/$UID_NUM"
+    [ ${#ITEM_LABEL[@]} -eq 1 ]; st_assert $? "plistの列挙"
+
+    # バックアップにダミーplistが含まれる
+    dir="$(make_backup)"
+    [ -d "$dir" ] && ls "$dir" 2>/dev/null | grep -q "com.example.selftest.plist"
+    st_assert $? "バックアップにplistが含まれる"
+    rm -rf "$dir" 2>/dev/null
+
+    # CSVエクスポート
+    tmpcsv="$(mktemp 2>/dev/null || mktemp -t smtest_csv)"
+    export_csv "$tmpcsv" >/dev/null
+    head -1 "$tmpcsv" | grep -q "名前"; st_assert $? "CSVエクスポート"
+    rm -f "$tmpcsv" "$tmp/com.example.selftest.plist" 2>/dev/null
+    rmdir "$tmp" 2>/dev/null
+
+    if [ $ST_FAILS -eq 0 ]; then
+        echo "== 全テスト合格 =="
+    else
+        echo "== $ST_FAILS 件失敗 =="
+        exit 1
+    fi
+}
+
+# ============================================================
 # 操作
 # ============================================================
 need_sudo() {
@@ -235,15 +316,33 @@ pick_index() {
 # メイン
 # ============================================================
 echo "StartupManager for macOS v$VERSION (完全オフライン動作)"
+
+case "${1:-}" in
+    --selftest)
+        run_selftest
+        exit 0
+        ;;
+    --backup)
+        collect
+        echo "バックアップ: $(make_backup)"
+        exit 0
+        ;;
+    --export)
+        [ -n "${2:-}" ] || { echo "出力ファイルを指定してください (例: --export items.csv)"; exit 1; }
+        collect
+        export_csv "$2"
+        exit 0
+        ;;
+    --list|-l)
+        collect
+        show_list
+        exit 0
+        ;;
+esac
+
 collect
-
-if [ "${1:-}" = "--list" ] || [ "${1:-}" = "-l" ]; then
-    show_list
-    exit 0
-fi
-
 show_list
-echo "コマンド: d <番号>=無効化  e <番号>=有効化  r <番号>=削除  b=バックアップ作成  s=復元  l=再表示  q=終了"
+echo "コマンド: d <番号>=無効化  e <番号>=有効化  r <番号>=削除  b=バックアップ作成  s=復元  c=CSV出力  l=再表示  q=終了"
 while true; do
     printf "> "
     read -r cmd arg || break
@@ -251,6 +350,7 @@ while true; do
         q|Q) break ;;
         l|L) collect; show_list ;;
         b|B) echo "バックアップ: $(make_backup)" ;;
+        c|C) export_csv "${arg:-$SCRIPT_DIR/StartupItems_$(date +%Y%m%d).csv}" ;;
         s|S) restore_menu; collect ;;
         d|D) idx="$(pick_index "${arg:-}")" && do_disable "$idx" && collect || echo "番号を指定してください (例: d 3)" ;;
         e|E) idx="$(pick_index "${arg:-}")" && do_enable "$idx" && collect || echo "番号を指定してください (例: e 3)" ;;

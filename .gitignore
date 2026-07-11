@@ -4,6 +4,9 @@ Backups/
 # 実行時に生成される個人設定
 settings.json
 
+# build-release.ps1 が生成する配布物
+StartupManager_v*.zip
+
 # その他
 *.log
 Thumbs.db

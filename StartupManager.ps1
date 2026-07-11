@@ -16,7 +16,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.6.0'
+$script:Version = '1.7.0'
 
 # ============================================================
 # 共通設定
@@ -965,6 +965,36 @@ $lv.Add_KeyDown({
 $txtSearch.Add_KeyDown({
     param($s, $e)
     if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $txtSearch.Clear(); $e.Handled = $true }
+})
+
+# F1でヘルプ (オフラインで完結)
+$form.KeyPreview = $true
+$form.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::F1) {
+        $help = @(
+            "StartupManager v$($script:Version)"
+            ''
+            '■ 基本操作'
+            '  一覧から項目を選び、下のボタンで有効化/無効化/完全削除。'
+            '  無効化はタスクマネージャーと同じ仕組みで、いつでも元に戻せます。'
+            '  完全削除は事前に自動バックアップが作られ、「復元...」で書き戻せます。'
+            ''
+            '■ キーボード'
+            '  F5=更新  Ctrl+A=全選択  Delete=無効化  Enter=詳細  Esc=検索クリア  F1=このヘルプ'
+            ''
+            '■ 便利機能'
+            '  ・行をダブルクリック → 詳細 (発行元/署名/無効化日時など)'
+            '  ・右クリック → 場所を開く / Webで検索 / 無効・リンク切れの一括選択'
+            '  ・exeを一覧にドラッグ&ドロップ → 新規追加'
+            '  ・赤字の行 = 実行ファイルが見つからない項目 (削除候補)'
+            ''
+            '■ コマンドライン'
+            '  -List / -Export ファイル.csv / -Backup / -SelfTest'
+        ) -join "`r`n"
+        [System.Windows.Forms.MessageBox]::Show($help, 'ヘルプ') | Out-Null
+        $e.Handled = $true
+    }
 })
 
 # 選択件数をステータスバーに表示

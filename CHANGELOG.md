@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.7.0 (2026-07-12)
+
+### 追加
+- macOS版にセルフテスト(`--selftest`・7項目)、CSVエクスポート(`--export` / 対話の `c`)、`--backup` を追加
+  (Windows版と主要機能を揃えた)
+- Windows版に F1 ヘルプ(オフラインで完結する操作ガイド)
+- `build-release.ps1`: 配布用ZIPを1コマンドで作成(Backups/settings.json/.git は含めない)
+
+### 改良
+- README: macOSのコマンドラインオプションと `chmod +x` の注意を追記
+
 ## v1.6.0 (2026-07-12)
 
 ### 追加
