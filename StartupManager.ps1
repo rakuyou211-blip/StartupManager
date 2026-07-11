@@ -16,7 +16,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.3.0'
+$script:Version = '1.4.0'
 
 # ============================================================
 # 共通設定
@@ -35,6 +35,10 @@ $script:FolderSources = @(
     @{ Name='スタートアップ(ユーザー)';   Path=[Environment]::GetFolderPath('Startup');       Approved='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'; Scope='User' }
     @{ Name='スタートアップ(全ユーザー)'; Path=[Environment]::GetFolderPath('CommonStartup'); Approved='HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'; Scope='Machine' }
 )
+
+# ストアアプリ(UWP)のスタートアップタスク。State: 0=無効,1=ユーザーが無効化,2=有効,3=ポリシーで無効,4=ポリシーで有効
+$script:UwpRoot = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData'
+$script:UwpNameCache = $null
 
 # ============================================================
 # StartupApproved (有効/無効) の読み書き
@@ -159,12 +163,39 @@ function Get-LogonTaskItems {
     return $result
 }
 
+function Get-UwpItems {
+    # ストアアプリ(UWP)のスタートアップタスク。タスクマネージャーの「スタートアップ アプリ」に出るものと同じ仕組み。
+    $result = @()
+    if (-not (Test-Path $script:UwpRoot)) { return $result }
+    if ($null -eq $script:UwpNameCache) {
+        $script:UwpNameCache = @{}
+        try {
+            foreach ($p in (Get-AppxPackage -ErrorAction Stop)) { $script:UwpNameCache[$p.PackageFamilyName] = $p.Name }
+        } catch {}
+    }
+    foreach ($pfnKey in (Get-ChildItem -Path $script:UwpRoot -ErrorAction SilentlyContinue)) {
+        foreach ($taskKey in (Get-ChildItem -Path $pfnKey.PSPath -ErrorAction SilentlyContinue)) {
+            $state = $null
+            try { $state = (Get-ItemProperty -Path $taskKey.PSPath -Name State -ErrorAction Stop).State } catch { continue }
+            $pfn = $pfnKey.PSChildName
+            $disp = if ($script:UwpNameCache.ContainsKey($pfn)) { $script:UwpNameCache[$pfn] } else { ($pfn -split '_')[0] }
+            $result += [pscustomobject]@{
+                Enabled=($state -eq 2 -or $state -eq 4); Name=($disp + ' (' + $taskKey.PSChildName + ')'); Type='ストアアプリ'; Command=$pfn;
+                Kind='Uwp'; RunPath=''; RegRoot=''; ApprovedPath=''; ValueName='';
+                Scope='User'; TaskName=''; TaskPath=''; FolderPath=''; FilePath=''; UwpKeyPath=[string]$taskKey.PSPath
+            }
+        }
+    }
+    return $result
+}
+
 function Get-AllStartupItems {
     param([bool]$IncludeSystemTasks)
     $all = @()
     $all += Get-RunItems
     $all += Get-FolderItems
     $all += Get-LogonTaskItems -IncludeSystem $IncludeSystemTasks
+    $all += Get-UwpItems
     return $all
 }
 
@@ -288,6 +319,10 @@ function Set-ItemState {
             if ($Enable) { Enable-ScheduledTask  -TaskName $Item.TaskName -TaskPath $Item.TaskPath | Out-Null }
             else         { Disable-ScheduledTask -TaskName $Item.TaskName -TaskPath $Item.TaskPath | Out-Null }
         }
+        'Uwp'    {
+            $v = if ($Enable) { 2 } else { 1 }
+            New-ItemProperty -Path $Item.UwpKeyPath -Name State -Value $v -PropertyType DWord -Force | Out-Null
+        }
     }
 }
 
@@ -313,6 +348,9 @@ function Remove-ItemHard {
             } catch {}
             Unregister-ScheduledTask -TaskName $Item.TaskName -TaskPath $Item.TaskPath -Confirm:$false
         }
+        'Uwp' {
+            throw 'ストアアプリの起動項目は削除できません。「無効化」を使うか、アプリ自体をアンインストールしてください。'
+        }
     }
 }
 
@@ -323,7 +361,7 @@ if ($List) {
     $items = Get-AllStartupItems -IncludeSystemTasks $false
     $items | Sort-Object Kind, Type, Name |
         Format-Table @{L='状態';E={ if($_.Enabled){'有効'}else{'無効'} }}, Name, Type, @{L='コマンド';E={ $_.Command }} -AutoSize | Out-String -Width 4000 | Write-Output
-    Write-Output ("--- 合計 {0} 件 (Run/Folder/Task, システムタスク除く) ---" -f $items.Count)
+    Write-Output ("--- 合計 {0} 件 (Run/フォルダ/タスク/ストアアプリ, システムタスク除く) ---" -f $items.Count)
     return
 }
 
@@ -384,6 +422,52 @@ if ($SelfTest) {
     Assert ((Test-Path (Join-Path $bk 'HKCU_StartupApproved.reg'))) 'バックアップにStartupApprovedが含まれる'
     Remove-Item -Path $bk -Recurse -Force -ErrorAction SilentlyContinue   # テストで作ったバックアップは削除
 
+    # スタートアップフォルダ項目の列挙と無効化
+    $folderSrc = $script:FolderSources[0]
+    $testFileName = 'ZZZ_SM_SelfTest.txt'
+    $testFile = Join-Path $folderSrc.Path $testFileName
+    try {
+        if (-not (Test-Path $folderSrc.Path)) { New-Item -ItemType Directory -Path $folderSrc.Path -Force | Out-Null }
+        Set-Content -LiteralPath $testFile -Value 'selftest'
+        $fi = @(Get-FolderItems) | Where-Object { $_.Name -eq $testFileName }
+        Assert ($null -ne $fi) 'スタートアップフォルダの項目が列挙される'
+        Set-ApprovedState $folderSrc.Approved $testFileName $false
+        $fi2 = @(Get-FolderItems) | Where-Object { $_.Name -eq $testFileName }
+        Assert (-not $fi2.Enabled) 'フォルダ項目の無効化が反映される'
+    } finally {
+        Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $folderSrc.Approved -Name $testFileName -ErrorAction SilentlyContinue
+    }
+
+    # 完全削除 → バックアップから復元 の往復 (エンドツーエンド)
+    $name2 = 'ZZZ_StartupManager_SelfTest2'
+    $bk2 = $null
+    try {
+        New-ItemProperty -Path $runKey -Name $name2 -Value '"C:\Windows\System32\cmd.exe" /c exit' -PropertyType String -Force | Out-Null
+        $bk2 = New-FullBackup
+        $it3 = @(Get-RunItems) | Where-Object { $_.Name -eq $name2 }
+        Remove-ItemHard -Item $it3 -BackupDir $bk2
+        Assert ($null -eq (@(Get-RunItems) | Where-Object { $_.Name -eq $name2 })) '完全削除で項目が消える'
+        Restore-FromBackup -Dir $bk2 | Out-Null
+        Assert ($null -ne (@(Get-RunItems) | Where-Object { $_.Name -eq $name2 })) 'バックアップからの復元で項目が戻る'
+    } finally {
+        Remove-ItemProperty -Path $runKey      -Name $name2 -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $approvedKey -Name $name2 -ErrorAction SilentlyContinue
+        if ($bk2) { Remove-Item -Path $bk2 -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # CSVエクスポート
+    $csvTmp = Join-Path $env:TEMP 'StartupManager_SelfTest.csv'
+    try {
+        Export-ItemsCsv -Items (Get-AllStartupItems -IncludeSystemTasks $false) -Path $csvTmp
+        Assert ((Test-Path $csvTmp) -and ((Get-Content $csvTmp -TotalCount 1) -match '名前')) 'CSVエクスポートが動作する'
+    } finally { Remove-Item -Path $csvTmp -Force -ErrorAction SilentlyContinue }
+
+    # ストアアプリ(UWP)の列挙
+    $uwOk = $true; $uw = @()
+    try { $uw = @(Get-UwpItems) } catch { $uwOk = $false }
+    Assert $uwOk ("ストアアプリの列挙がエラーなく動作する ({0} 件)" -f $uw.Count)
+
     if ($script:fails -eq 0) { Write-Output '== 全テスト合格 ==' }
     else { Write-Output ("== {0} 件失敗 ==" -f $script:fails); exit 1 }
     return
@@ -421,6 +505,28 @@ $form.StartPosition = 'CenterScreen'
 $form.MinimumSize = New-Object System.Drawing.Size(920, 480)
 try { $form.Font = New-Object System.Drawing.Font('Meiryo UI', 9) } catch {}
 
+# --- 設定の読み込み (ウィンドウサイズ / システムタスク表示) ---
+$script:SettingsFile = Join-Path $PSScriptRoot 'settings.json'
+$script:Settings = $null
+try {
+    if (Test-Path $script:SettingsFile) { $script:Settings = Get-Content $script:SettingsFile -Raw | ConvertFrom-Json }
+} catch {}
+if ($script:Settings) {
+    try {
+        if ([int]$script:Settings.Width -ge 920 -and [int]$script:Settings.Height -ge 480) {
+            $form.Size = New-Object System.Drawing.Size([int]$script:Settings.Width, [int]$script:Settings.Height)
+        }
+    } catch {}
+}
+$form.Add_FormClosing({
+    try {
+        $w = $form.Width; $h = $form.Height
+        if ($form.WindowState -ne 'Normal') { $w = $form.RestoreBounds.Width; $h = $form.RestoreBounds.Height }
+        @{ Width = $w; Height = $h; ShowSystemTasks = [bool]$chkSystem.Checked } |
+            ConvertTo-Json | Set-Content -Path $script:SettingsFile -Encoding UTF8
+    } catch {}
+})
+
 # --- 上部: 検索 / オプション ---
 $lblSearch = New-Object System.Windows.Forms.Label
 $lblSearch.Text = '絞り込み:'
@@ -438,6 +544,7 @@ $chkSystem = New-Object System.Windows.Forms.CheckBox
 $chkSystem.Text = 'システムのタスクも表示'
 $chkSystem.Location = New-Object System.Drawing.Point(330, 13)
 $chkSystem.AutoSize = $true
+if ($script:Settings -and $script:Settings.ShowSystemTasks) { $chkSystem.Checked = $true }  # イベント登録前なので再列挙は走らない
 $form.Controls.Add($chkSystem)
 
 $lblAdmin = New-Object System.Windows.Forms.Label
@@ -620,8 +727,13 @@ function Refresh-List {
 
 # 再列挙 + 再描画 (状態変更・削除・更新ボタン用)
 function Update-List {
-    Reload-Items
-    Refresh-List
+    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        Reload-Items
+        Refresh-List
+    } finally {
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
 }
 
 function Get-SelectedItems {
@@ -658,13 +770,14 @@ $miDisable = $ctx.Items.Add('無効化')
 $miOpenLoc = $ctx.Items.Add('ファイルの場所を開く')
 $miOpenSrc = $ctx.Items.Add('定義元を開く (レジストリ/タスク/フォルダ)')
 $miCopyCmd = $ctx.Items.Add('コマンドをコピー')
+$miSearch  = $ctx.Items.Add('この名前をWebで検索')
 $miDetail  = $ctx.Items.Add('詳細を表示')
 [void]$ctx.Items.Add('-')
 $miRemove  = $ctx.Items.Add('完全削除...')
 $lv.ContextMenuStrip = $ctx
 $ctx.Add_Opening({
     $has = ($lv.SelectedItems.Count -gt 0)
-    foreach ($mi in @($miEnable,$miDisable,$miOpenLoc,$miOpenSrc,$miCopyCmd,$miDetail,$miRemove)) { $mi.Enabled = $has }
+    foreach ($mi in @($miEnable,$miDisable,$miOpenLoc,$miOpenSrc,$miCopyCmd,$miSearch,$miDetail,$miRemove)) { $mi.Enabled = $has }
 })
 
 function Show-ItemDetail {
@@ -698,6 +811,7 @@ function Show-ItemDetail {
     if ($it.Kind -eq 'Run')    { $lines += "レジストリ: $($it.RegRoot)" }
     if ($it.Kind -eq 'Folder') { $lines += "ファイル: $($it.FilePath)" }
     if ($it.Kind -eq 'Task')   { $lines += "タスク: $($it.TaskPath)$($it.TaskName)" }
+    if ($it.Kind -eq 'Uwp')    { $lines += "パッケージ: $($it.Command)"; $lines += "※ ストアアプリは有効化/無効化のみ対応 (削除はアンインストールで)" }
     [System.Windows.Forms.MessageBox]::Show(($lines -join "`r`n"), '詳細 - ' + $it.Name) | Out-Null
 }
 
@@ -723,6 +837,7 @@ function Open-ItemSource {
         }
         'Folder' { if ($it.FolderPath) { Start-Process explorer.exe $it.FolderPath } }
         'Task'   { Start-Process taskschd.msc }
+        'Uwp'    { Start-Process 'ms-settings:startupapps' }   # Windows設定の「スタートアップ アプリ」
     }
 }
 
@@ -735,6 +850,14 @@ $miCopyCmd.Add_Click({
     if ($sel.Count -gt 0) {
         $text = ($sel | ForEach-Object { $_.Command }) -join "`r`n"
         if ($text) { [System.Windows.Forms.Clipboard]::SetText($text) }
+    }
+})
+$miSearch.Add_Click({
+    $sel = Get-SelectedItems
+    if ($sel.Count -gt 0) {
+        $name = $sel[0].Name -replace '\.(lnk|exe|bat|cmd)$', ''
+        $q = [Uri]::EscapeDataString($name + ' スタートアップ')
+        Start-Process ('https://www.google.com/search?q=' + $q)
     }
 })
 $miDetail.Add_Click({ $sel = Get-SelectedItems; if ($sel.Count -gt 0) { Show-ItemDetail $sel[0] } })
