@@ -1,0 +1,7 @@
+# 実行時に生成されるバックアップ (個人環境の情報を含むため配布しない)
+Backups/
+
+# その他
+*.log
+Thumbs.db
+desktop.ini
