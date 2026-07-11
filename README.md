@@ -32,12 +32,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File StartupManager.ps1 -Export i
 
 # バックアップだけ作成
 powershell -NoProfile -ExecutionPolicy Bypass -File StartupManager.ps1 -Backup
+
+# 動作セルフテスト (HKCUにダミー項目を作って無効化/有効化の往復を検証し、後片付けまで自動)
+powershell -NoProfile -ExecutionPolicy Bypass -File StartupManager.ps1 -SelfTest
 ```
 
 ## 機能
 
 - 起動項目の一覧表示(状態 / 名前 / 種類 / **発行元** / コマンド)
 - 有効化 / 無効化(タスクマネージャー互換の可逆操作)
+- **新規追加**: 実行ファイルを選ぶだけでレジストリRunに起動項目を登録(HKCU/HKLM)
 - 完全削除(削除前に自動でバックアップを作成)
 - **バックアップからの復元**(GUIから日時を選んでワンクリックで書き戻し)
 - **リンク切れ検出**: 実行ファイルが存在しない項目を赤字で表示(アンインストール残骸の掃除に)
@@ -48,6 +52,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File StartupManager.ps1 -Backup
 - CSV エクスポート(GUI / コマンドライン両対応)
 - システムタスク(`\Microsoft\` 配下)の表示切替
 - キーボードショートカット: `F5` 更新 / `Ctrl+A` 全選択 / `Delete` 無効化 / `Enter` 詳細 / `Esc` 検索クリア
+- 行にマウスを乗せるとフルコマンドをツールチップ表示
+- 詳細に無効化した日時を表示(タスクマネージャーで無効化したものも判別可能)
+- 非管理者で起動した場合は「管理者として再起動」リンクをワンクリック
+- 多重起動防止
+- `-SelfTest` による動作セルフテスト(CI等での確認にも)
 
 ## バックアップと復元
 

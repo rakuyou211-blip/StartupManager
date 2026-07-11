@@ -11,11 +11,12 @@
 param(
     [switch]$List,
     [string]$Export,
-    [switch]$Backup
+    [switch]$Backup,
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.2.0'
+$script:Version = '1.3.0'
 
 # ============================================================
 # 共通設定
@@ -70,6 +71,19 @@ function Set-ApprovedState {
     if (-not (Test-Path $ApprovedKeyPath)) { New-Item -Path $ApprovedKeyPath -Force | Out-Null }
     $bytes = New-ApprovedBytes -Enable:$Enable
     New-ItemProperty -Path $ApprovedKeyPath -Name $ValueName -Value $bytes -PropertyType Binary -Force | Out-Null
+}
+
+function Get-DisabledDate {
+    # 無効化された日時 (StartupApprovedの5バイト目以降のFILETIME) を返す。有効なら$null
+    param($ApprovedKeyPath, $ValueName)
+    try {
+        $v = (Get-ItemProperty -Path $ApprovedKeyPath -Name $ValueName -ErrorAction Stop).$ValueName
+        if ($v -is [byte[]] -and $v.Length -ge 12 -and (($v[0] -band 0x01) -eq 1)) {
+            $ft = [BitConverter]::ToInt64($v, 4)
+            if ($ft -gt 0) { return [DateTime]::FromFileTime($ft) }
+        }
+    } catch {}
+    return $null
 }
 
 # ============================================================
@@ -327,6 +341,55 @@ if ($Backup) {
 }
 
 # ============================================================
+# -SelfTest: コア機能の動作テスト
+#   HKCUにダミー項目を作成し、列挙 → 無効化 → 再有効化 → 後片付け を検証。
+#   実在の起動項目には一切触れない。
+# ============================================================
+if ($SelfTest) {
+    $script:fails = 0
+    function Assert { param($Cond, $Label)
+        if ($Cond) { Write-Output "PASS: $Label" } else { Write-Output "FAIL: $Label"; $script:fails++ }
+    }
+    Write-Output "== StartupManager v$($script:Version) セルフテスト =="
+    $name = 'ZZZ_StartupManager_SelfTest'
+    $runKey = $script:RunSources[0].Run          # HKCU Run
+    $approvedKey = $script:RunSources[0].Approved
+    try {
+        New-ItemProperty -Path $runKey -Name $name -Value '"C:\Windows\System32\cmd.exe" /c exit' -PropertyType String -Force | Out-Null
+        $it = @(Get-RunItems) | Where-Object { $_.Name -eq $name }
+        Assert ($null -ne $it) '登録した項目が列挙される'
+        Assert ($it.Enabled) '初期状態は有効と判定される'
+
+        Set-ApprovedState $approvedKey $name $false
+        Assert ((Get-ApprovedState $approvedKey $name) -eq $false) '無効化がStartupApprovedに反映される'
+        $it2 = @(Get-RunItems) | Where-Object { $_.Name -eq $name }
+        Assert (-not $it2.Enabled) '列挙結果にも無効が反映される'
+        Assert ($null -ne (Get-DisabledDate $approvedKey $name)) '無効化日時が記録される'
+
+        Set-ApprovedState $approvedKey $name $true
+        Assert ((Get-ApprovedState $approvedKey $name) -eq $true) '再有効化が反映される'
+    } finally {
+        Remove-ItemProperty -Path $runKey      -Name $name -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $approvedKey -Name $name -ErrorAction SilentlyContinue
+    }
+    Assert ($null -eq (@(Get-RunItems) | Where-Object { $_.Name -eq $name })) 'テスト項目が後片付けされた'
+
+    Assert ((Get-ExecutablePath '"C:\Windows\System32\cmd.exe" /c exit') -eq 'C:\Windows\System32\cmd.exe') 'パス解決: 引用符+引数'
+    Assert ((Get-ExecutablePath 'C:\Windows\System32\cmd.exe') -eq 'C:\Windows\System32\cmd.exe') 'パス解決: 素のパス'
+    Assert ((Get-ExecutablePath 'C:\Windows\System32\cmd.exe /c exit') -eq 'C:\Windows\System32\cmd.exe') 'パス解決: 引用符なし+引数'
+    Assert ($null -eq (Get-ExecutablePath 'C:\存在しないフォルダ\nothing.exe --x')) 'パス解決: 存在しないパスはnull'
+
+    $bk = New-FullBackup
+    Assert ((Test-Path (Join-Path $bk 'HKCU_Run.reg'))) 'バックアップにHKCU_Run.regが含まれる'
+    Assert ((Test-Path (Join-Path $bk 'HKCU_StartupApproved.reg'))) 'バックアップにStartupApprovedが含まれる'
+    Remove-Item -Path $bk -Recurse -Force -ErrorAction SilentlyContinue   # テストで作ったバックアップは削除
+
+    if ($script:fails -eq 0) { Write-Output '== 全テスト合格 ==' }
+    else { Write-Output ("== {0} 件失敗 ==" -f $script:fails); exit 1 }
+    return
+}
+
+# ============================================================
 # GUI
 # ============================================================
 # コンソールウィンドウを隠す
@@ -339,6 +402,15 @@ try {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+# 多重起動防止
+$script:Mutex = New-Object System.Threading.Mutex($false, 'StartupManagerGUI_SingleInstance')
+$owned = $false
+try { $owned = $script:Mutex.WaitOne(0, $false) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+if (-not $owned) {
+    [System.Windows.Forms.MessageBox]::Show('StartupManager はすでに起動しています。', 'StartupManager') | Out-Null
+    return
+}
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 
@@ -376,6 +448,23 @@ else          { $lblAdmin.Text = '管理者: 無効 (システム項目は操作
 $lblAdmin.Anchor = 'Top,Right'
 $form.Controls.Add($lblAdmin)
 
+# 非管理者のときはワンクリックで昇格再起動できるリンクを出す
+if (-not $isAdmin) {
+    $lnkAdmin = New-Object System.Windows.Forms.LinkLabel
+    $lnkAdmin.Text = '管理者として再起動'
+    $lnkAdmin.AutoSize = $true
+    $lnkAdmin.Location = New-Object System.Drawing.Point(790, 15)
+    $lnkAdmin.Anchor = 'Top,Right'
+    $lnkAdmin.Add_LinkClicked({
+        try {
+            try { $script:Mutex.ReleaseMutex() } catch {}
+            Start-Process powershell.exe -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"') -Verb RunAs
+            $form.Close()
+        } catch {}   # UACキャンセル時は何もしない
+    })
+    $form.Controls.Add($lnkAdmin)
+}
+
 # --- 一覧 ---
 $lv = New-Object System.Windows.Forms.ListView
 $lv.Location = New-Object System.Drawing.Point(12, 45)
@@ -390,6 +479,11 @@ $lv.Anchor = 'Top,Bottom,Left,Right'
 [void]$lv.Columns.Add('種類', 160)
 [void]$lv.Columns.Add('発行元', 150)
 [void]$lv.Columns.Add('コマンド / パス', 350)
+$lv.ShowItemToolTips = $true
+# ちらつき防止 (DoubleBufferedはprotectedなのでリフレクションで設定)
+try {
+    $lv.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic').SetValue($lv, $true, $null)
+} catch {}
 $form.Controls.Add($lv)
 
 # 列クリックソートの状態 (-1 = 既定ソート: 無効を先頭 → 分類 → 名前)
@@ -412,14 +506,15 @@ function New-Btn($text, $w) {
     return $b
 }
 $btnRefresh = New-Btn '更新' 70
-$btnEnable  = New-Btn '有効化' 90
-$btnDisable = New-Btn '無効化' 90
-$btnRemove  = New-Btn '完全削除' 100
-$btnBackup  = New-Btn 'バックアップ作成' 140
-$btnRestore = New-Btn '復元...' 80
-$btnOpen    = New-Btn '保存場所を開く' 120
-$btnCsv     = New-Btn 'CSV出力' 90
-$panel.Controls.AddRange(@($btnRefresh,$btnEnable,$btnDisable,$btnRemove,$btnBackup,$btnRestore,$btnOpen,$btnCsv))
+$btnAdd     = New-Btn '新規追加' 90
+$btnEnable  = New-Btn '有効化' 80
+$btnDisable = New-Btn '無効化' 80
+$btnRemove  = New-Btn '完全削除' 90
+$btnBackup  = New-Btn 'バックアップ作成' 130
+$btnRestore = New-Btn '復元...' 70
+$btnOpen    = New-Btn '保存場所を開く' 115
+$btnCsv     = New-Btn 'CSV出力' 80
+$panel.Controls.AddRange(@($btnRefresh,$btnAdd,$btnEnable,$btnDisable,$btnRemove,$btnBackup,$btnRestore,$btnOpen,$btnCsv))
 
 # --- ステータスバー (件数表示。ボタン列と分離して隠れないように) ---
 $statusStrip = New-Object System.Windows.Forms.StatusStrip
@@ -506,6 +601,10 @@ function Refresh-List {
         [void]$lvi.SubItems.Add([string]$it.Command)
         if ($it.Missing) { $lvi.ForeColor = [System.Drawing.Color]::Firebrick }
         elseif (-not $it.Enabled) { $lvi.ForeColor = [System.Drawing.Color]::Gray }
+        $tip = [string]$it.Command
+        if ($it.ExePath) { $tip += "`r`n実行ファイル: $($it.ExePath)" }
+        if ($it.Missing) { $tip += "`r`n⚠ ファイルが見つかりません" }
+        $lvi.ToolTipText = $tip
         $lvi.Tag = $it
         [void]$lv.Items.Add($lvi)
     }
@@ -515,7 +614,8 @@ function Refresh-List {
     $broken = @($visible | Where-Object { $_.Missing }).Count
     $text = '{0} 件を表示中 (有効 {1} / 無効 {2}' -f @($visible).Count, (@($visible).Count - $disabled), $disabled
     if ($broken -gt 0) { $text += " / リンク切れ $broken" }
-    $status.Text = $text + ')'
+    $script:StatusBase = $text + ')'
+    $status.Text = $script:StatusBase
 }
 
 # 再列挙 + 再描画 (状態変更・削除・更新ボタン用)
@@ -578,6 +678,10 @@ function Show-ItemDetail {
         "コマンド: $($it.Command)"
     )
     if ($it.Missing) { $lines += "⚠ 実行ファイルが見つかりません (リンク切れ。削除候補です)" }
+    if (-not $it.Enabled -and $it.ApprovedPath) {
+        $d = Get-DisabledDate $it.ApprovedPath $it.ValueName
+        if ($d) { $lines += "無効化した日時: $($d.ToString('yyyy/MM/dd HH:mm'))" }
+    }
     if ($exe) {
         $lines += "実行ファイル: $exe"
         try {
@@ -672,10 +776,100 @@ $txtSearch.Add_KeyDown({
     if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $txtSearch.Clear(); $e.Handled = $true }
 })
 
+# 選択件数をステータスバーに表示
+$lv.Add_SelectedIndexChanged({
+    $n = $lv.SelectedItems.Count
+    if ($n -gt 0) { $status.Text = $script:StatusBase + " - 選択 $n 件" }
+    else { $status.Text = $script:StatusBase }
+})
+
 # --- イベント ---
 $btnRefresh.Add_Click({ Update-List })
 $chkSystem.Add_CheckedChanged({ Update-List })
 $txtSearch.Add_TextChanged({ Refresh-List })
+
+# --- 新規追加ダイアログ (レジストリRunに登録) ---
+$btnAdd.Add_Click({
+    $d = New-Object System.Windows.Forms.Form
+    $d.Text = '起動項目を新規追加 (レジストリRun)'
+    $d.Size = New-Object System.Drawing.Size(480, 270)
+    $d.StartPosition = 'CenterParent'
+    $d.FormBorderStyle = 'FixedDialog'
+    $d.MaximizeBox = $false; $d.MinimizeBox = $false
+
+    $lblN = New-Object System.Windows.Forms.Label
+    $lblN.Text = '名前:'; $lblN.Location = New-Object System.Drawing.Point(12, 18); $lblN.AutoSize = $true
+    $txtN = New-Object System.Windows.Forms.TextBox
+    $txtN.Location = New-Object System.Drawing.Point(110, 15); $txtN.Size = New-Object System.Drawing.Size(340, 24)
+
+    $lblE = New-Object System.Windows.Forms.Label
+    $lblE.Text = '実行ファイル:'; $lblE.Location = New-Object System.Drawing.Point(12, 50); $lblE.AutoSize = $true
+    $txtE = New-Object System.Windows.Forms.TextBox
+    $txtE.Location = New-Object System.Drawing.Point(110, 47); $txtE.Size = New-Object System.Drawing.Size(260, 24)
+    $btnBrowse = New-Object System.Windows.Forms.Button
+    $btnBrowse.Text = '参照...'; $btnBrowse.Location = New-Object System.Drawing.Point(378, 45); $btnBrowse.Size = New-Object System.Drawing.Size(72, 27)
+
+    $lblA = New-Object System.Windows.Forms.Label
+    $lblA.Text = '引数 (任意):'; $lblA.Location = New-Object System.Drawing.Point(12, 82); $lblA.AutoSize = $true
+    $txtA = New-Object System.Windows.Forms.TextBox
+    $txtA.Location = New-Object System.Drawing.Point(110, 79); $txtA.Size = New-Object System.Drawing.Size(340, 24)
+
+    $rbUser = New-Object System.Windows.Forms.RadioButton
+    $rbUser.Text = '現在のユーザーのみ (HKCU)'; $rbUser.Location = New-Object System.Drawing.Point(110, 112); $rbUser.AutoSize = $true; $rbUser.Checked = $true
+    $rbAll = New-Object System.Windows.Forms.RadioButton
+    $rbAll.Text = '全ユーザー (HKLM / 管理者権限が必要)'; $rbAll.Location = New-Object System.Drawing.Point(110, 137); $rbAll.AutoSize = $true
+
+    $okB = New-Object System.Windows.Forms.Button
+    $okB.Text = '追加'; $okB.Location = New-Object System.Drawing.Point(280, 185); $okB.Size = New-Object System.Drawing.Size(80, 30)
+    $cancelB = New-Object System.Windows.Forms.Button
+    $cancelB.Text = 'キャンセル'; $cancelB.DialogResult = 'Cancel'
+    $cancelB.Location = New-Object System.Drawing.Point(370, 185); $cancelB.Size = New-Object System.Drawing.Size(82, 30)
+
+    $d.Controls.AddRange(@($lblN,$txtN,$lblE,$txtE,$btnBrowse,$lblA,$txtA,$rbUser,$rbAll,$okB,$cancelB))
+    $d.AcceptButton = $okB; $d.CancelButton = $cancelB
+
+    $btnBrowse.Add_Click({
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Filter = 'プログラム (*.exe;*.bat;*.cmd)|*.exe;*.bat;*.cmd|すべてのファイル (*.*)|*.*'
+        if ($ofd.ShowDialog($d) -eq [System.Windows.Forms.DialogResult]::OK) {
+            $txtE.Text = $ofd.FileName
+            if (-not $txtN.Text.Trim()) { $txtN.Text = [System.IO.Path]::GetFileNameWithoutExtension($ofd.FileName) }
+        }
+    })
+
+    $okB.Add_Click({
+        $name = $txtN.Text.Trim()
+        $exe  = $txtE.Text.Trim('"', ' ')
+        if (-not $name) { [System.Windows.Forms.MessageBox]::Show('名前を入力してください。', '新規追加') | Out-Null; return }
+        if (-not $exe -or -not (Test-Path -LiteralPath $exe)) {
+            [System.Windows.Forms.MessageBox]::Show('実行ファイルが存在しません。', '新規追加') | Out-Null; return
+        }
+        if ($rbAll.Checked -and -not $isAdmin) {
+            [System.Windows.Forms.MessageBox]::Show('全ユーザーへの登録には管理者権限が必要です。', '新規追加') | Out-Null; return
+        }
+        $key = if ($rbAll.Checked) { $script:RunSources[1].Run } else { $script:RunSources[0].Run }
+        $existing = $null
+        try { $existing = (Get-ItemProperty -Path $key -Name $name -ErrorAction Stop).$name } catch {}
+        if ($null -ne $existing) {
+            $r = [System.Windows.Forms.MessageBox]::Show(
+                "同名の項目がすでに存在します:`r`n$existing`r`n`r`n上書きしますか?", '新規追加',
+                [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        }
+        $cmd = '"' + $exe + '"'
+        if ($txtA.Text.Trim()) { $cmd += ' ' + $txtA.Text.Trim() }
+        try {
+            if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+            New-ItemProperty -Path $key -Name $name -Value $cmd -PropertyType String -Force | Out-Null
+            $d.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $d.Close()
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show("追加に失敗しました: $($_.Exception.Message)", '新規追加') | Out-Null
+        }
+    })
+
+    if ($d.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) { Update-List }
+})
 
 $btnEnable.Add_Click({
     Invoke-OnSelection -Verb '有効化' -Action { param($it) Set-ItemState -Item $it -Enable $true } | Out-Null
