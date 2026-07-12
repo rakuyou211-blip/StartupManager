@@ -14,12 +14,11 @@
 
 ---
 
-<!-- TODO: Releaseを公開したら、下のダウンロードリンクを実際のリリースURL/ZIP名に差し替える -->
 ## ⬇ ダウンロード（最新版）
 
-**現在、正式なRelease（配布用ZIP）はまだ公開していません。**
-いまはこのリポジトリの緑の「Code」ボタン →「Download ZIP」でソースごと落として使えます。
-（ちゃんとした配布ZIPを用意でき次第、ここにリンクを貼ります。）
+**→ [最新版（v1.8.0）をダウンロード](https://github.com/rakuyou211-blip/StartupManager/releases/latest)**
+
+`StartupManager_v1.8.0.zip` を落として展開し、`StartupManager.bat`（Macは `StartupManager.command`）で起動します。
 
 最新は **v1.8.0**（2026-07-12）。復元まわりのバグをまとめて直したバージョンです。
 
