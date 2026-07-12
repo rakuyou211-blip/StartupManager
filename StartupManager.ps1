@@ -16,13 +16,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.7.0'
+$script:Version = '1.8.0'
 
 # ============================================================
 # 共通設定
 # ============================================================
 $script:BackupRoot = Join-Path $PSScriptRoot 'Backups'
-$script:SessionBackupDone = $false
+$script:LastBackupDir = $null
 $script:MetaProps = @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')
 
 $script:RunSources = @(
@@ -233,12 +233,25 @@ function Get-ExecutablePath {
     return $null
 }
 
+# 項目の「起動場所」(どこに登録されているか) を人が読める文字列で返す
+function Get-ItemLocation {
+    param($Item)
+    switch ($Item.Kind) {
+        'Run'    { return $Item.RegRoot }
+        'Folder' { return $Item.FolderPath }
+        'Task'   { return ('タスク: ' + $Item.TaskPath + $Item.TaskName) }
+        'Uwp'    { return 'ストアアプリ (AppModel/HKCU)' }
+    }
+    return ''
+}
+
 function Export-ItemsCsv {
     param($Items, [string]$Path)
     $Items | Sort-Object Kind, Type, Name | Select-Object `
         @{N='状態';   E={ if ($_.Enabled) { '有効' } else { '無効' } }},
         @{N='名前';   E={ $_.Name }},
         @{N='種類';   E={ $_.Type }},
+        @{N='起動場所'; E={ Get-ItemLocation $_ }},
         @{N='コマンド'; E={ $_.Command }},
         @{N='範囲';   E={ $_.Scope }},
         @{N='分類';   E={ $_.Kind }} |
@@ -277,13 +290,6 @@ function New-FullBackup {
     return $dir
 }
 
-function Ensure-SessionBackup {
-    if ($script:SessionBackupDone) { return $script:LastBackupDir }
-    $script:LastBackupDir = New-FullBackup
-    $script:SessionBackupDone = $true
-    return $script:LastBackupDir
-}
-
 # バックアップフォルダの内容を現在の環境に書き戻す
 function Restore-FromBackup {
     param([string]$Dir)
@@ -307,12 +313,21 @@ function Restore-FromBackup {
             catch { $log += "失敗: $($f.Name) : $($_.Exception.Message)" }
         }
     }
-    # タスク (削除時に書き出したXML)
+    # タスク (削除時に書き出したXML)。隣の .meta から元のTaskName/TaskPathを復元する
     foreach ($f in (Get-ChildItem -Path $Dir -Filter 'task_*.xml' -File -ErrorAction SilentlyContinue)) {
         $name = $f.BaseName.Substring(5)
+        $taskPath = '\'
+        $meta = [System.IO.Path]::ChangeExtension($f.FullName, '.meta')
+        if (Test-Path -LiteralPath $meta) {
+            try {
+                $lines = Get-Content -LiteralPath $meta -ErrorAction Stop
+                if ($lines.Count -ge 1 -and $lines[0]) { $name = $lines[0] }
+                if ($lines.Count -ge 2 -and $lines[1]) { $taskPath = $lines[1] }
+            } catch {}
+        }
         try {
-            Register-ScheduledTask -TaskName $name -Xml (Get-Content -LiteralPath $f.FullName -Raw) -Force | Out-Null
-            $log += "OK: タスク $name"
+            Register-ScheduledTask -TaskName $name -TaskPath $taskPath -Xml (Get-Content -LiteralPath $f.FullName -Raw) -Force | Out-Null
+            $log += "OK: タスク $taskPath$name"
         } catch { $log += "失敗: タスク $name : $($_.Exception.Message)" }
     }
     if ($log.Count -eq 0) { $log = @('復元対象が見つかりませんでした。') }
@@ -338,25 +353,40 @@ function Set-ItemState {
     }
 }
 
+# レジストリ値が存在する場合のみ削除する。アクセス拒否など本当のエラーは呼び出し元へ伝える
+function Remove-RegValueIfPresent {
+    param($Path, $Name)
+    $exists = $false
+    try { $exists = $null -ne (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } catch { $exists = $false }
+    if ($exists) { Remove-ItemProperty -Path $Path -Name $Name -ErrorAction Stop }
+}
+
 function Remove-ItemHard {
     param($Item, $BackupDir)
     switch ($Item.Kind) {
         'Run' {
-            Remove-ItemProperty -Path $Item.RunPath      -Name $Item.ValueName -ErrorAction SilentlyContinue
-            Remove-ItemProperty -Path $Item.ApprovedPath -Name $Item.ValueName -ErrorAction SilentlyContinue
+            # 値の削除は -ErrorAction Stop。権限不足などは例外として呼び出し元(Invoke-OnSelection)が集計する
+            Remove-ItemProperty -Path $Item.RunPath -Name $Item.ValueName -ErrorAction Stop
+            Remove-RegValueIfPresent $Item.ApprovedPath $Item.ValueName
         }
         'Folder' {
-            if (Test-Path $Item.FilePath) {
-                try { Move-Item -Path $Item.FilePath -Destination (Join-Path $BackupDir ('removed_' + $Item.ValueName)) -Force }
-                catch { Remove-Item -Path $Item.FilePath -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $Item.FilePath) {
+                # バックアップ側へ退避 (これ自体が失敗したら削除もしない=データを守る)
+                Move-Item -LiteralPath $Item.FilePath -Destination (Join-Path $BackupDir ('removed_' + $Item.ValueName)) -Force -ErrorAction Stop
             }
-            Remove-ItemProperty -Path $Item.ApprovedPath -Name $Item.ValueName -ErrorAction SilentlyContinue
+            Remove-RegValueIfPresent $Item.ApprovedPath $Item.ValueName
         }
         'Task' {
+            # ファイル名を TaskPath 込みで一意化し、元の TaskName/TaskPath を .meta に保存 (正確な復元のため)
+            $full = ($Item.TaskPath + $Item.TaskName).TrimStart('\')
+            $safe = ($full -replace '[\\/:*?"<>|]', '_')
+            $base = Join-Path $BackupDir ('task_' + $safe)
+            $xmlPath = $base + '.xml'
+            $n = 1
+            while (Test-Path -LiteralPath $xmlPath) { $xmlPath = $base + "_$n.xml"; $n++ }
             try {
-                $safe = ($Item.TaskName -replace '[\\/:*?"<>|]', '_')
-                Export-ScheduledTask -TaskName $Item.TaskName -TaskPath $Item.TaskPath |
-                    Out-File (Join-Path $BackupDir ('task_' + $safe + '.xml')) -Encoding utf8
+                Export-ScheduledTask -TaskName $Item.TaskName -TaskPath $Item.TaskPath | Out-File $xmlPath -Encoding utf8
+                ($Item.TaskName, $Item.TaskPath) | Set-Content -LiteralPath ([System.IO.Path]::ChangeExtension($xmlPath, '.meta')) -Encoding UTF8
             } catch {}
             Unregister-ScheduledTask -TaskName $Item.TaskName -TaskPath $Item.TaskPath -Confirm:$false
         }
@@ -409,6 +439,7 @@ if ($SelfTest) {
         $it = @(Get-RunItems) | Where-Object { $_.Name -eq $name }
         Assert ($null -ne $it) '登録した項目が列挙される'
         Assert ($it.Enabled) '初期状態は有効と判定される'
+        Assert ((Get-ItemLocation $it) -eq $script:RunSources[0].RegRoot) '起動場所が正しく表示される'
 
         Set-ApprovedState $approvedKey $name $false
         Assert ((Get-ApprovedState $approvedKey $name) -eq $false) '無効化がStartupApprovedに反映される'
@@ -475,24 +506,26 @@ if ($SelfTest) {
         Assert ((Test-Path $csvTmp) -and ((Get-Content $csvTmp -TotalCount 1) -match '名前')) 'CSVエクスポートが動作する'
     } finally { Remove-Item -Path $csvTmp -Force -ErrorAction SilentlyContinue }
 
-    # ストアアプリ(UWP)の列挙
-    $uwOk = $true; $uw = @()
-    try { $uw = @(Get-UwpItems) } catch { $uwOk = $false }
-    Assert $uwOk ("ストアアプリの列挙がエラーなく動作する ({0} 件)" -f $uw.Count)
+    # ストアアプリ(UWP)の列挙 (実項目には触れない)
+    $uwOk = $true
+    try { $null = @(Get-UwpItems) } catch { $uwOk = $false }
+    Assert $uwOk 'ストアアプリの列挙がエラーなく動作する'
 
-    # ストアアプリの状態切替の往復 (元のStateを必ず書き戻す)
-    if ($uw.Count -gt 0) {
-        $u = $uw[0]
-        $orig = (Get-ItemProperty -Path $u.UwpKeyPath -Name State).State
-        try {
-            Set-ItemState -Item $u -Enable (-not $u.Enabled)
-            $after = @(Get-UwpItems) | Where-Object { $_.UwpKeyPath -eq $u.UwpKeyPath }
-            Assert ($after.Enabled -ne $u.Enabled) 'ストアアプリの有効/無効の切替が反映される'
-        } finally {
-            New-ItemProperty -Path $u.UwpKeyPath -Name State -Value $orig -PropertyType DWord -Force | Out-Null
-        }
-        $restored = (Get-ItemProperty -Path $u.UwpKeyPath -Name State).State
-        Assert ($restored -eq $orig) 'ストアアプリの状態を元の値に戻せる'
+    # ストアアプリの状態切替は、実在アプリではなく専用のダミーキーで検証する
+    $uwpPkg  = Join-Path $script:UwpRoot 'ZZZ_SM_SelfTest_pkg'
+    $uwpTest = Join-Path $uwpPkg 'ZZZ_SM_SelfTest_task'
+    try {
+        New-Item -Path $uwpTest -Force | Out-Null
+        New-ItemProperty -Path $uwpTest -Name State -Value 2 -PropertyType DWord -Force | Out-Null
+        $dummy = [pscustomobject]@{ Kind='Uwp'; UwpKeyPath=$uwpTest }
+        Set-ItemState -Item $dummy -Enable $false
+        Assert ((Get-ItemProperty -Path $uwpTest -Name State).State -eq 1) 'ストアアプリの無効化(State=1)が書き込める'
+        Set-ItemState -Item $dummy -Enable $true
+        Assert ((Get-ItemProperty -Path $uwpTest -Name State).State -eq 2) 'ストアアプリの有効化(State=2)が書き込める'
+    } catch {
+        Assert $false ("ストアアプリの状態切替テスト: " + $_.Exception.Message)
+    } finally {
+        Remove-Item -Path $uwpPkg -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     # 実行中プロセスの検出
@@ -615,10 +648,11 @@ $lv.GridLines = $true
 $lv.MultiSelect = $true
 $lv.Anchor = 'Top,Bottom,Left,Right'
 [void]$lv.Columns.Add('状態', 60)
-[void]$lv.Columns.Add('名前', 220)
-[void]$lv.Columns.Add('種類', 160)
-[void]$lv.Columns.Add('発行元', 150)
-[void]$lv.Columns.Add('コマンド / パス', 350)
+[void]$lv.Columns.Add('名前', 200)
+[void]$lv.Columns.Add('種類', 140)
+[void]$lv.Columns.Add('発行元', 130)
+[void]$lv.Columns.Add('起動場所', 200)
+[void]$lv.Columns.Add('コマンド / パス', 250)
 $lv.ShowItemToolTips = $true
 # ちらつき防止 (DoubleBufferedはprotectedなのでリフレクションで設定)
 try {
@@ -733,7 +767,8 @@ function Refresh-List {
         1 { $sorted = $visible | Sort-Object Name }
         2 { $sorted = $visible | Sort-Object Type, Name }
         3 { $sorted = $visible | Sort-Object Publisher, Name }
-        4 { $sorted = $visible | Sort-Object Command }
+        4 { $sorted = $visible | Sort-Object @{E={ Get-ItemLocation $_ }}, Name }
+        5 { $sorted = $visible | Sort-Object Command }
         default { $sorted = $visible | Sort-Object @{E={ -not $_.Enabled }}, Kind, Name }
     }
     $sorted = @($sorted)
@@ -747,10 +782,12 @@ function Refresh-List {
         [void]$lvi.SubItems.Add([string]$it.Name)
         [void]$lvi.SubItems.Add([string]$it.Type)
         [void]$lvi.SubItems.Add($pubText)
+        [void]$lvi.SubItems.Add((Get-ItemLocation $it))
         [void]$lvi.SubItems.Add([string]$it.Command)
         if ($it.Missing) { $lvi.ForeColor = [System.Drawing.Color]::Firebrick }
         elseif (-not $it.Enabled) { $lvi.ForeColor = [System.Drawing.Color]::Gray }
         $tip = [string]$it.Command
+        $tip += "`r`n起動場所: " + (Get-ItemLocation $it)
         if ($it.ExePath) { $tip += "`r`n実行ファイル: $($it.ExePath)" }
         if ($it.IsRunning) { $tip += "`r`n▶ 現在実行中" }
         if ($it.Missing) { $tip += "`r`n⚠ ファイルが見つかりません" }
@@ -1037,27 +1074,32 @@ function Show-AddDialog {
     $txtA = New-Object System.Windows.Forms.TextBox
     $txtA.Location = New-Object System.Drawing.Point(110, 79); $txtA.Size = New-Object System.Drawing.Size(340, 24)
 
-    $lblM = New-Object System.Windows.Forms.Label
-    $lblM.Text = '登録方法:'; $lblM.Location = New-Object System.Drawing.Point(12, 114); $lblM.AutoSize = $true
+    # 登録方法 / 対象 はそれぞれ独立した排他グループにする。
+    # WinForamsはRadioButtonを「直近の親コンテナ」でグループ化するため、GroupBoxで分けないと
+    # 4つのラジオが1グループになり、片方を選ぶともう片方が外れる不具合になる。
+    $grpM = New-Object System.Windows.Forms.GroupBox
+    $grpM.Text = '登録方法'; $grpM.Location = New-Object System.Drawing.Point(12, 108); $grpM.Size = New-Object System.Drawing.Size(452, 46)
     $rbReg = New-Object System.Windows.Forms.RadioButton
-    $rbReg.Text = 'レジストリ Run'; $rbReg.Location = New-Object System.Drawing.Point(110, 112); $rbReg.AutoSize = $true; $rbReg.Checked = $true
+    $rbReg.Text = 'レジストリ Run'; $rbReg.Location = New-Object System.Drawing.Point(12, 16); $rbReg.AutoSize = $true; $rbReg.Checked = $true
     $rbFolder = New-Object System.Windows.Forms.RadioButton
-    $rbFolder.Text = 'スタートアップフォルダ (ショートカット)'; $rbFolder.Location = New-Object System.Drawing.Point(230, 112); $rbFolder.AutoSize = $true
+    $rbFolder.Text = 'スタートアップフォルダ (ショートカット)'; $rbFolder.Location = New-Object System.Drawing.Point(150, 16); $rbFolder.AutoSize = $true
+    $grpM.Controls.AddRange(@($rbReg, $rbFolder))
 
-    $lblS = New-Object System.Windows.Forms.Label
-    $lblS.Text = '対象:'; $lblS.Location = New-Object System.Drawing.Point(12, 146); $lblS.AutoSize = $true
+    $grpS = New-Object System.Windows.Forms.GroupBox
+    $grpS.Text = '対象'; $grpS.Location = New-Object System.Drawing.Point(12, 160); $grpS.Size = New-Object System.Drawing.Size(452, 68)
     $rbUser = New-Object System.Windows.Forms.RadioButton
-    $rbUser.Text = '現在のユーザーのみ'; $rbUser.Location = New-Object System.Drawing.Point(110, 144); $rbUser.AutoSize = $true; $rbUser.Checked = $true
+    $rbUser.Text = '現在のユーザーのみ'; $rbUser.Location = New-Object System.Drawing.Point(12, 16); $rbUser.AutoSize = $true; $rbUser.Checked = $true
     $rbAll = New-Object System.Windows.Forms.RadioButton
-    $rbAll.Text = '全ユーザー (管理者権限が必要)'; $rbAll.Location = New-Object System.Drawing.Point(110, 169); $rbAll.AutoSize = $true
+    $rbAll.Text = '全ユーザー (管理者権限が必要)'; $rbAll.Location = New-Object System.Drawing.Point(12, 40); $rbAll.AutoSize = $true
+    $grpS.Controls.AddRange(@($rbUser, $rbAll))
 
     $okB = New-Object System.Windows.Forms.Button
-    $okB.Text = '追加'; $okB.Location = New-Object System.Drawing.Point(280, 240); $okB.Size = New-Object System.Drawing.Size(80, 30)
+    $okB.Text = '追加'; $okB.Location = New-Object System.Drawing.Point(282, 240); $okB.Size = New-Object System.Drawing.Size(80, 30)
     $cancelB = New-Object System.Windows.Forms.Button
     $cancelB.Text = 'キャンセル'; $cancelB.DialogResult = 'Cancel'
-    $cancelB.Location = New-Object System.Drawing.Point(370, 240); $cancelB.Size = New-Object System.Drawing.Size(82, 30)
+    $cancelB.Location = New-Object System.Drawing.Point(372, 240); $cancelB.Size = New-Object System.Drawing.Size(82, 30)
 
-    $d.Controls.AddRange(@($lblN,$txtN,$lblE,$txtE,$btnBrowse,$lblA,$txtA,$lblM,$rbReg,$rbFolder,$lblS,$rbUser,$rbAll,$okB,$cancelB))
+    $d.Controls.AddRange(@($lblN,$txtN,$lblE,$txtE,$btnBrowse,$lblA,$txtA,$grpM,$grpS,$okB,$cancelB))
     $d.AcceptButton = $okB; $d.CancelButton = $cancelB
 
     # ドロップやファイル指定からの事前入力 (.lnkはリンク先を解決)
@@ -1172,7 +1214,9 @@ $btnRemove.Add_Click({
         [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Warning)
     if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-    $bk = Ensure-SessionBackup
+    # 削除のたびに新しいバックアップを作成する (確認ダイアログの約束どおり、毎回保存)
+    $script:LastBackupDir = New-FullBackup
+    $bk = $script:LastBackupDir
     # スクリプトブロック内から確実に参照できるよう script スコープの変数を使う
     Invoke-OnSelection -Verb '完全削除' -Action { param($it) Remove-ItemHard -Item $it -BackupDir $script:LastBackupDir } | Out-Null
     [System.Windows.Forms.MessageBox]::Show("削除しました。`r`nバックアップ場所:`r`n$bk", '完全削除') | Out-Null

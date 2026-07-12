@@ -14,7 +14,7 @@
 #
 set -u
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKUP_ROOT="$SCRIPT_DIR/Backups"
 PLISTBUDDY="/usr/libexec/PlistBuddy"
@@ -47,7 +47,8 @@ plist_program() {
 
 is_disabled() {
     # $1=domain $2=label。launchctlの無効化オーバーライドに載っているか
-    launchctl print-disabled "$1" 2>/dev/null | grep -Eq "\"$2\" => (disabled|true)"
+    # ラベルは正規表現ではなく固定文字列として扱う (ラベルに . + ( 等が含まれても誤判定しないため)
+    launchctl print-disabled "$1" 2>/dev/null | grep -F "\"$2\" =>" | grep -Eq '=> (disabled|true)'
 }
 
 add_plist_dir() {
@@ -119,6 +120,22 @@ show_list() {
 # ============================================================
 # バックアップ / 復元
 # ============================================================
+# root所有のplist(デーモン/全体エージェント)はsudoで読む必要がある種別か
+root_owned_type() {
+    case "$1" in Daemon|GlobalAgent) return 0 ;; *) return 1 ;; esac
+}
+
+# 指定インデックスのplistをバックアップdirへコピーし、コピーが実在したときだけ0を返す。
+# plistを持たない種別(ログイン項目)は2を返す。
+backup_item_plist() {
+    local i="$1" dir="$2" cpcmd="cp" dest
+    [ -n "${ITEM_PATH[$i]}" ] && [ -f "${ITEM_PATH[$i]}" ] || return 2
+    root_owned_type "${ITEM_TYPE[$i]}" && cpcmd="sudo cp"
+    dest="$dir/${ITEM_TYPE[$i]}_$(basename "${ITEM_PATH[$i]}")"
+    $cpcmd "${ITEM_PATH[$i]}" "$dest" 2>/dev/null
+    [ -f "$dest" ]
+}
+
 make_backup() {
     local ts dir i
     ts="$(date +%Y%m%d_%H%M%S)"
@@ -126,9 +143,7 @@ make_backup() {
     mkdir -p "$dir"
     i=0
     while [ $i -lt ${#ITEM_LABEL[@]} ]; do
-        if [ -n "${ITEM_PATH[$i]}" ] && [ -f "${ITEM_PATH[$i]}" ]; then
-            cp "${ITEM_PATH[$i]}" "$dir/${ITEM_TYPE[$i]}_$(basename "${ITEM_PATH[$i]}")" 2>/dev/null
-        fi
+        backup_item_plist "$i" "$dir"
         i=$((i+1))
     done
     osascript -e 'tell application "System Events" to get the name of every login item' > "$dir/login_items.txt" 2>/dev/null
@@ -222,6 +237,7 @@ PLIST
     ITEM_LABEL=(); ITEM_PATH=(); ITEM_TYPE=(); ITEM_DOMAIN=(); ITEM_STATE=(); ITEM_PROG=()
     add_plist_dir "$tmp" "UserAgent" "gui/$UID_NUM"
     [ ${#ITEM_LABEL[@]} -eq 1 ]; st_assert $? "plistの列挙"
+    show_detail 0 | grep -q "起動場所"; st_assert $? "詳細表示に起動場所が含まれる"
 
     # バックアップにダミーplistが含まれる
     dir="$(make_backup)"
@@ -233,8 +249,21 @@ PLIST
     tmpcsv="$(mktemp 2>/dev/null || mktemp -t smtest_csv)"
     export_csv "$tmpcsv" >/dev/null
     head -1 "$tmpcsv" | grep -q "名前"; st_assert $? "CSVエクスポート"
+
+    # CSVのエスケープ (カンマ/引用符を含む値が壊れない)
+    ITEM_LABEL=('a,b "c"'); ITEM_PATH=("/tmp/x.plist"); ITEM_TYPE=("UserAgent")
+    ITEM_DOMAIN=("gui/$UID_NUM"); ITEM_STATE=("有効"); ITEM_PROG=("")
+    export_csv "$tmpcsv" >/dev/null
+    grep -q '"a,b ""c"""' "$tmpcsv"; st_assert $? "CSVのカンマ/引用符エスケープ"
     rm -f "$tmpcsv" "$tmp/com.example.selftest.plist" 2>/dev/null
     rmdir "$tmp" 2>/dev/null
+
+    # is_disabled は正規表現メタ文字を含むラベルでも正しく判定する (grep -F 化の検証)
+    launchctl() { printf '\t"com.foo+bar(1)" => disabled\n'; }
+    is_disabled "gui/$UID_NUM" "com.foo+bar(1)"; st_assert $? "メタ文字ラベルの無効判定"
+    launchctl() { printf '\t"com.foo+bar(1)" => enabled\n'; }
+    is_disabled "gui/$UID_NUM" "com.foo+bar(1)"; rc=$?; [ $rc -ne 0 ]; st_assert $? "メタ文字ラベルの有効判定"
+    unset -f launchctl
 
     if [ $ST_FAILS -eq 0 ]; then
         echo "== 全テスト合格 =="
@@ -280,27 +309,43 @@ do_enable() {
 }
 
 do_remove() {
-    local i=$1 bk
+    local i=$1 bk ans bkfile
     printf "「%s」を削除します。削除前にバックアップを作成します。よろしいですか? [y/N]: " "${ITEM_LABEL[$i]}"
     read -r ans
     [ "$ans" = "y" ] || [ "$ans" = "Y" ] || { echo "中止しました。"; return; }
+    if [ "${ITEM_TYPE[$i]}" = "LoginItem" ]; then
+        echo "※ ログイン項目はバックアップから自動復元できません (名前のみ記録されます)。"
+    fi
     bk="$(make_backup)"
     echo "バックアップ: $bk"
     case "${ITEM_TYPE[$i]}" in
         LoginItem)
-            if osascript -e "tell application \"System Events\" to delete login item \"${ITEM_LABEL[$i]}\"" >/dev/null 2>&1; then
+            # 名前は argv 経由で渡す (引用符やバックスラッシュを含む名前でも壊れず、AppleScriptインジェクションも防ぐ)
+            if osascript - "${ITEM_LABEL[$i]}" >/dev/null 2>&1 <<'OSA'
+on run argv
+    tell application "System Events" to delete login item (item 1 of argv)
+end run
+OSA
+            then
                 echo "削除しました: ${ITEM_LABEL[$i]}"
             else
                 echo "失敗しました: ${ITEM_LABEL[$i]}"
             fi
             ;;
-        UserAgent)
-            launchctl bootout "${ITEM_DOMAIN[$i]}/${ITEM_LABEL[$i]}" 2>/dev/null
-            rm -f "${ITEM_PATH[$i]}" && echo "削除しました: ${ITEM_PATH[$i]}"
-            ;;
-        GlobalAgent|Daemon)
-            sudo launchctl bootout "${ITEM_DOMAIN[$i]}/${ITEM_LABEL[$i]}" 2>/dev/null
-            sudo rm -f "${ITEM_PATH[$i]}" && echo "削除しました: ${ITEM_PATH[$i]}"
+        UserAgent|GlobalAgent|Daemon)
+            # バックアップが実際に取れていなければ削除しない (データ損失防止)
+            bkfile="$bk/${ITEM_TYPE[$i]}_$(basename "${ITEM_PATH[$i]}")"
+            if [ ! -f "$bkfile" ]; then
+                echo "中止: この項目のバックアップを作成できませんでした。削除しません (権限をご確認ください)。"
+                return
+            fi
+            if root_owned_type "${ITEM_TYPE[$i]}"; then
+                sudo launchctl bootout "${ITEM_DOMAIN[$i]}/${ITEM_LABEL[$i]}" 2>/dev/null
+                sudo rm -f "${ITEM_PATH[$i]}" && echo "削除しました: ${ITEM_PATH[$i]}"
+            else
+                launchctl bootout "${ITEM_DOMAIN[$i]}/${ITEM_LABEL[$i]}" 2>/dev/null
+                rm -f "${ITEM_PATH[$i]}" && echo "削除しました: ${ITEM_PATH[$i]}"
+            fi
             ;;
     esac
 }
@@ -310,6 +355,19 @@ pick_index() {
     case "$1" in (*[!0-9]*|'') return 1 ;; esac
     [ "$1" -ge 1 ] && [ "$1" -le ${#ITEM_LABEL[@]} ] || return 1
     echo "$(($1 - 1))"
+}
+
+show_detail() {
+    local i=$1 loc
+    if [ -n "${ITEM_PATH[$i]}" ]; then loc="${ITEM_PATH[$i]}"; else loc="システム設定 > 一般 > ログイン項目"; fi
+    echo ""
+    echo "名前      : ${ITEM_LABEL[$i]}"
+    echo "種類      : $(type_name "${ITEM_TYPE[$i]}")"
+    echo "状態      : ${ITEM_STATE[$i]}"
+    echo "起動場所  : $loc"
+    echo "プログラム: ${ITEM_PROG[$i]:-（不明）}"
+    [ -n "${ITEM_DOMAIN[$i]}" ] && echo "ドメイン  : ${ITEM_DOMAIN[$i]}"
+    echo ""
 }
 
 # ============================================================
@@ -342,7 +400,7 @@ esac
 
 collect
 show_list
-echo "コマンド: d <番号>=無効化  e <番号>=有効化  r <番号>=削除  b=バックアップ作成  s=復元  c=CSV出力  l=再表示  q=終了"
+echo "コマンド: d <番号>=無効化  e <番号>=有効化  r <番号>=削除  i <番号>=詳細(起動場所)  b=バックアップ  s=復元  c=CSV出力  l=再表示  q=終了"
 while true; do
     printf "> "
     read -r cmd arg || break
@@ -351,12 +409,13 @@ while true; do
         l|L) collect; show_list ;;
         b|B) echo "バックアップ: $(make_backup)" ;;
         c|C) export_csv "${arg:-$SCRIPT_DIR/StartupItems_$(date +%Y%m%d).csv}" ;;
-        s|S) restore_menu; collect ;;
-        d|D) idx="$(pick_index "${arg:-}")" && do_disable "$idx" && collect || echo "番号を指定してください (例: d 3)" ;;
-        e|E) idx="$(pick_index "${arg:-}")" && do_enable "$idx" && collect || echo "番号を指定してください (例: e 3)" ;;
-        r|R) idx="$(pick_index "${arg:-}")" && { do_remove "$idx"; collect; } || echo "番号を指定してください (例: r 3)" ;;
+        s|S) restore_menu; collect; show_list ;;
+        d|D) idx="$(pick_index "${arg:-}")" && { do_disable "$idx"; collect; show_list; } || echo "番号を指定してください (例: d 3)" ;;
+        e|E) idx="$(pick_index "${arg:-}")" && { do_enable "$idx"; collect; show_list; } || echo "番号を指定してください (例: e 3)" ;;
+        r|R) idx="$(pick_index "${arg:-}")" && { do_remove "$idx"; collect; show_list; } || echo "番号を指定してください (例: r 3)" ;;
+        i|I) idx="$(pick_index "${arg:-}")" && show_detail "$idx" || echo "番号を指定してください (例: i 3)" ;;
         '') ;;
-        *) echo "不明なコマンドです。d/e/r <番号>, b, s, l, q" ;;
+        *) echo "不明なコマンドです。d/e/r/i <番号>, b, s, c, l, q" ;;
     esac
 done
 echo "終了しました。"
