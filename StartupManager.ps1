@@ -16,7 +16,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.8.0'
+$script:Version = '1.9.0'
 
 # ============================================================
 # 共通設定
@@ -243,6 +243,18 @@ function Get-ItemLocation {
         'Uwp'    { return 'ストアアプリ (AppModel/HKCU)' }
     }
     return ''
+}
+
+# Microsoft製 / Windows標準の項目かどうか (サードパーティ絞り込み用)。
+# 発行元がMicrosoft、または実行ファイルがWindowsフォルダ配下なら「標準側」とみなす。
+$script:WinDirLower = ([string]$env:SystemRoot).ToLower()
+function Test-IsThirdParty {
+    param($Item)
+    if ($Item.Publisher -and ($Item.Publisher -match 'Microsoft')) { return $false }
+    if ($Item.ExePath -and $Item.ExePath.ToLower().StartsWith($script:WinDirLower)) { return $false }
+    # ストアアプリは発行元が空になりがちなので、パッケージ名/Microsoftの発行元ハッシュでも判定
+    if ($Item.Kind -eq 'Uwp' -and $Item.Command -and ($Item.Command -match 'Microsoft|8wekyb3d8bbwe')) { return $false }
+    return $true
 }
 
 function Export-ItemsCsv {
@@ -506,6 +518,16 @@ if ($SelfTest) {
         Assert ((Test-Path $csvTmp) -and ((Get-Content $csvTmp -TotalCount 1) -match '名前')) 'CSVエクスポートが動作する'
     } finally { Remove-Item -Path $csvTmp -Force -ErrorAction SilentlyContinue }
 
+    # サードパーティ判定
+    $msItem   = [pscustomobject]@{ Publisher='Microsoft Corporation'; ExePath='C:\Windows\System32\a.exe' }
+    $winItem  = [pscustomobject]@{ Publisher='';                      ExePath=(Join-Path $env:SystemRoot 'x.exe') }
+    $thirdItem= [pscustomobject]@{ Publisher='Acme Inc.';             ExePath='C:\Program Files\Acme\app.exe' }
+    $uwpMs    = [pscustomobject]@{ Kind='Uwp'; Command='Microsoft.WindowsTerminal_8wekyb3d8bbwe'; Publisher=''; ExePath=$null }
+    Assert (-not (Test-IsThirdParty $msItem))   'Microsoft発行元は標準側と判定'
+    Assert (-not (Test-IsThirdParty $winItem))  'Windowsフォルダ配下は標準側と判定'
+    Assert (-not (Test-IsThirdParty $uwpMs))    'Microsoftストアアプリはパッケージ名で標準側と判定'
+    Assert (Test-IsThirdParty $thirdItem)       'サードパーティ製は第三者と判定'
+
     # ストアアプリ(UWP)の列挙 (実項目には触れない)
     $uwOk = $true
     try { $null = @(Get-UwpItems) } catch { $uwOk = $false }
@@ -588,7 +610,7 @@ $form.Add_FormClosing({
     try {
         $w = $form.Width; $h = $form.Height
         if ($form.WindowState -ne 'Normal') { $w = $form.RestoreBounds.Width; $h = $form.RestoreBounds.Height }
-        @{ Width = $w; Height = $h; ShowSystemTasks = [bool]$chkSystem.Checked } |
+        @{ Width = $w; Height = $h; ShowSystemTasks = [bool]$chkSystem.Checked; ThirdPartyOnly = [bool]$chkThirdParty.Checked } |
             ConvertTo-Json | Set-Content -Path $script:SettingsFile -Encoding UTF8
     } catch {}
 })
@@ -601,23 +623,31 @@ $lblSearch.AutoSize = $true
 $form.Controls.Add($lblSearch)
 
 $txtSearch = New-Object System.Windows.Forms.TextBox
-$txtSearch.Location = New-Object System.Drawing.Point(75, 12)
-$txtSearch.Size = New-Object System.Drawing.Size(240, 24)
+$txtSearch.Location = New-Object System.Drawing.Point(72, 12)
+$txtSearch.Size = New-Object System.Drawing.Size(210, 24)
 $txtSearch.Anchor = 'Top,Left'
 $form.Controls.Add($txtSearch)
 
+# サードパーティ製のみ表示 (Microsoft/Windows標準を隠す)。起動を軽くする掃除に便利
+$chkThirdParty = New-Object System.Windows.Forms.CheckBox
+$chkThirdParty.Text = 'サードパーティのみ'
+$chkThirdParty.Location = New-Object System.Drawing.Point(292, 14)
+$chkThirdParty.AutoSize = $true
+if ($script:Settings -and $script:Settings.ThirdPartyOnly) { $chkThirdParty.Checked = $true }
+$form.Controls.Add($chkThirdParty)
+
 $chkSystem = New-Object System.Windows.Forms.CheckBox
 $chkSystem.Text = 'システムのタスクも表示'
-$chkSystem.Location = New-Object System.Drawing.Point(330, 13)
+$chkSystem.Location = New-Object System.Drawing.Point(440, 14)
 $chkSystem.AutoSize = $true
 if ($script:Settings -and $script:Settings.ShowSystemTasks) { $chkSystem.Checked = $true }  # イベント登録前なので再列挙は走らない
 $form.Controls.Add($chkSystem)
 
 $lblAdmin = New-Object System.Windows.Forms.Label
 $lblAdmin.AutoSize = $true
-$lblAdmin.Location = New-Object System.Drawing.Point(500, 15)
-if ($isAdmin) { $lblAdmin.Text = '管理者: 有効 (全項目を操作可)'; $lblAdmin.ForeColor = [System.Drawing.Color]::Green }
-else          { $lblAdmin.Text = '管理者: 無効 (システム項目は操作不可)'; $lblAdmin.ForeColor = [System.Drawing.Color]::Firebrick }
+$lblAdmin.Location = New-Object System.Drawing.Point(660, 15)
+if ($isAdmin) { $lblAdmin.Text = '管理者: 有効'; $lblAdmin.ForeColor = [System.Drawing.Color]::Green }
+else          { $lblAdmin.Text = '管理者: 無効'; $lblAdmin.ForeColor = [System.Drawing.Color]::Firebrick }
 $lblAdmin.Anchor = 'Top,Right'
 $form.Controls.Add($lblAdmin)
 
@@ -626,7 +656,7 @@ if (-not $isAdmin) {
     $lnkAdmin = New-Object System.Windows.Forms.LinkLabel
     $lnkAdmin.Text = '管理者として再起動'
     $lnkAdmin.AutoSize = $true
-    $lnkAdmin.Location = New-Object System.Drawing.Point(790, 15)
+    $lnkAdmin.Location = New-Object System.Drawing.Point(760, 15)
     $lnkAdmin.Anchor = 'Top,Right'
     $lnkAdmin.Add_LinkClicked({
         try {
@@ -755,7 +785,9 @@ function Refresh-List {
     $lv.Items.Clear()
     $filter = $txtSearch.Text.Trim()
 
+    $thirdPartyOnly = $chkThirdParty.Checked
     $visible = @($script:CachedItems | Where-Object {
+        if ($thirdPartyOnly -and -not (Test-IsThirdParty $_)) { return $false }
         if ($filter -eq '') { return $true }
         $hay = ($_.Name + ' ' + $_.Type + ' ' + $_.Publisher + ' ' + $_.Command)
         $hay.IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0
@@ -813,7 +845,12 @@ function Refresh-List {
     $broken = @($visible | Where-Object { $_.Missing }).Count
     $text = '{0} 件を表示中 (有効 {1} / 無効 {2}' -f @($visible).Count, (@($visible).Count - $disabled), $disabled
     if ($broken -gt 0) { $text += " / リンク切れ $broken" }
-    $script:StatusBase = $text + ')'
+    $text += ')'
+    if ($thirdPartyOnly) {
+        $msCount = @($script:CachedItems | Where-Object { -not (Test-IsThirdParty $_) }).Count
+        if ($msCount -gt 0) { $text += " ｜ Microsoft/標準 $msCount 件を非表示" }
+    }
+    $script:StatusBase = $text
     $status.Text = $script:StatusBase
 }
 
@@ -1021,6 +1058,7 @@ $form.Add_KeyDown({
             '  F5=更新  Ctrl+A=全選択  Delete=無効化  Enter=詳細  Esc=検索クリア  F1=このヘルプ'
             ''
             '■ 便利機能'
+            '  ・「サードパーティのみ」= Microsoft/Windows標準を隠して掃除対象を絞る'
             '  ・行をダブルクリック → 詳細 (発行元/署名/無効化日時など)'
             '  ・右クリック → 場所を開く / Webで検索 / 無効・リンク切れの一括選択'
             '  ・exeを一覧にドラッグ&ドロップ → 新規追加'
@@ -1044,6 +1082,7 @@ $lv.Add_SelectedIndexChanged({
 # --- イベント ---
 $btnRefresh.Add_Click({ Update-List })
 $chkSystem.Add_CheckedChanged({ Update-List })
+$chkThirdParty.Add_CheckedChanged({ Refresh-List })   # 発行元はキャッシュ済みなので再列挙不要
 $txtSearch.Add_TextChanged({ Refresh-List })
 
 # --- 新規追加ダイアログ (レジストリRun / スタートアップフォルダ) ---
