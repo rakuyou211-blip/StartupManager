@@ -16,7 +16,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.10.0'
+$script:Version = '1.11.0'
 
 # ============================================================
 # 共通設定
@@ -274,12 +274,23 @@ function Get-SensitiveHint {
     return ''
 }
 
+# 項目の発行元を返す。GUIで算出済みならそれを使い、無ければ実行ファイルから求める(CLIのCSV出力用)。
+function Get-ItemPublisher {
+    param($Item)
+    if ($Item.PSObject.Properties['Publisher'] -and $Item.Publisher) { return [string]$Item.Publisher }
+    $seg = (([string]$Item.Command) -split ' \| ')[0]
+    $exe = Get-ExecutablePath $seg
+    if ($exe) { try { return [string]([System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe).CompanyName) } catch {} }
+    return ''
+}
+
 function Export-ItemsCsv {
     param($Items, [string]$Path)
     $Items | Sort-Object Kind, Type, Name | Select-Object `
         @{N='状態';   E={ if ($_.Enabled) { '有効' } else { '無効' } }},
         @{N='名前';   E={ $_.Name }},
         @{N='種類';   E={ $_.Type }},
+        @{N='発行元'; E={ Get-ItemPublisher $_ }},
         @{N='起動場所'; E={ Get-ItemLocation $_ }},
         @{N='コマンド'; E={ $_.Command }},
         @{N='範囲';   E={ $_.Scope }},
@@ -532,7 +543,9 @@ if ($SelfTest) {
     $csvTmp = Join-Path $env:TEMP 'StartupManager_SelfTest.csv'
     try {
         Export-ItemsCsv -Items (Get-AllStartupItems -IncludeSystemTasks $false) -Path $csvTmp
-        Assert ((Test-Path $csvTmp) -and ((Get-Content $csvTmp -TotalCount 1) -match '名前')) 'CSVエクスポートが動作する'
+        $csvHead = Get-Content $csvTmp -TotalCount 1
+        Assert ((Test-Path $csvTmp) -and ($csvHead -match '名前')) 'CSVエクスポートが動作する'
+        Assert ($csvHead -match '発行元') 'CSVに発行元列が含まれる'
     } finally { Remove-Item -Path $csvTmp -Force -ErrorAction SilentlyContinue }
 
     # サードパーティ判定
