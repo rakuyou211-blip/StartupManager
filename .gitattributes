@@ -8,3 +8,10 @@
 # macOS/Unix用スクリプトはLF (CRLFだとshebangが壊れて動かない)
 *.command text eol=lf
 *.sh text eol=lf
+
+# 配布ZIP (GitHubリリースのSource code) から、利用者に不要なファイルを除外する
+# → ダウンロードした中身を「本体＋説明書」だけにする
+build-release.ps1 export-ignore
+宣伝文.md         export-ignore
+.gitignore        export-ignore
+.gitattributes    export-ignore

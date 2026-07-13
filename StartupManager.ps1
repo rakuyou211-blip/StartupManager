@@ -16,7 +16,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.11.0'
+$script:Version = '1.11.1'
 
 # ============================================================
 # 共通設定

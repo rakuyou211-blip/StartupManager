@@ -16,11 +16,11 @@
 
 ## ⬇ ダウンロード（最新版）
 
-**→ [最新版（v1.11.0）をダウンロード](https://github.com/rakuyou211-blip/StartupManager/releases/latest)**
+**→ [最新版（v1.11.1）をダウンロード](https://github.com/rakuyou211-blip/StartupManager/releases/latest)**
 
-開いたページにある ZIP を落として展開し、`StartupManager.bat`（Macは `StartupManager.command`）で起動します。
+開いたページの **Assets** にある ZIP を落として展開し、`StartupManager.bat`（Macは `StartupManager.command`）で起動します。
 
-最新は **v1.11.0**（2026-07-13）。掃除の道具を、少しだけ賢くしました。「あとから入れたものだけ」を絞り込む表示や、大事そうなものを消す前の一声を足しています（くわしくは `CHANGELOG.md`）。
+最新は **v1.11.1**（2026-07-13）。掃除の道具を、少しだけ賢くしました。「あとから入れたものだけ」を絞り込む表示や、大事そうなものを消す前の一声を足しています（くわしくは [`CHANGELOG.md`](CHANGELOG.md)）。
 
 ---
 
