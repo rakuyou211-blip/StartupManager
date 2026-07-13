@@ -16,7 +16,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.9.0'
+$script:Version = '1.10.0'
 
 # ============================================================
 # 共通設定
@@ -255,6 +255,23 @@ function Test-IsThirdParty {
     # ストアアプリは発行元が空になりがちなので、パッケージ名/Microsoftの発行元ハッシュでも判定
     if ($Item.Kind -eq 'Uwp' -and $Item.Command -and ($Item.Command -match 'Microsoft|8wekyb3d8bbwe')) { return $false }
     return $true
+}
+
+# 「止める/消すと影響が出やすい」項目への、やさしい注意文を返す (該当しなければ空文字)。
+# 断定せず「可能性があります」に留める — 迷ったら止める・分からないものは消さない、という方針に沿う。
+function Get-SensitiveHint {
+    param($Item)
+    $hay = (([string]$Item.Name) + ' ' + ([string]$Item.Publisher) + ' ' + ([string]$Item.Command) + ' ' + ([string]$Item.ExePath)).ToLower()
+    if ($hay -match 'defender|antivirus|eset|norton|mcafee|avast|\bavg\b|kaspersky|bitdefender|malwarebytes|trend ?micro|securityhealth|f-secure|sophos|webroot') {
+        return 'セキュリティ対策ソフトの可能性があります。止めるとPCの保護が弱まる恐れがあります。'
+    }
+    if ($hay -match 'realtek|nvidia|\bamd\b|synaptics|\belan\b|touchpad|igfx|hdaudio|audio|soundblaster|logitech|\blogi\b|dolby|waves') {
+        return 'ハードウェア(音声/画面/入力など)の常駐の可能性があります。止めると一部の機能が使えなくなることがあります。'
+    }
+    if ($hay -match 'onedrive|dropbox|google ?drive|googledrive|icloud|nextcloud|megasync|backup') {
+        return 'クラウド同期/バックアップの可能性があります。止めると自動保存や同期が止まる場合があります。'
+    }
+    return ''
 }
 
 function Export-ItemsCsv {
@@ -527,6 +544,12 @@ if ($SelfTest) {
     Assert (-not (Test-IsThirdParty $winItem))  'Windowsフォルダ配下は標準側と判定'
     Assert (-not (Test-IsThirdParty $uwpMs))    'Microsoftストアアプリはパッケージ名で標準側と判定'
     Assert (Test-IsThirdParty $thirdItem)       'サードパーティ製は第三者と判定'
+
+    # 重要そうな項目の注意判定
+    Assert ((Get-SensitiveHint ([pscustomobject]@{ Name='SecurityHealth'; Publisher='Microsoft'; Command=''; ExePath='' }))    -match 'セキュリティ') 'セキュリティ項目を検出'
+    Assert ((Get-SensitiveHint ([pscustomobject]@{ Name='RtkAudUService'; Publisher='Realtek'; Command=''; ExePath='' }))       -match 'ハードウェア') 'ドライバー項目を検出'
+    Assert ((Get-SensitiveHint ([pscustomobject]@{ Name='OneDrive'; Publisher='Microsoft'; Command=''; ExePath='onedrive.exe' })) -match '同期|バックアップ') 'クラウド同期項目を検出'
+    Assert ((Get-SensitiveHint ([pscustomobject]@{ Name='Acme'; Publisher='Acme'; Command='app.exe'; ExePath='app.exe' }))       -eq '')            '無関係な項目には注意を出さない'
 
     # ストアアプリ(UWP)の列挙 (実項目には触れない)
     $uwOk = $true
@@ -938,6 +961,10 @@ function Show-ItemDetail {
             if ($vi.FileVersion)    { $lines += "バージョン: $($vi.FileVersion)" }
         } catch {}
         try {
+            $fi = Get-Item -LiteralPath $exe -ErrorAction Stop
+            $lines += "ファイルの更新日時: $($fi.LastWriteTime.ToString('yyyy/MM/dd'))  (いつ頃入ったものかの目安)"
+        } catch {}
+        try {
             $sig = Get-AuthenticodeSignature -LiteralPath $exe -ErrorAction Stop
             $lines += "署名: $(if ($sig.Status -eq 'Valid') { '有効 (' + $sig.SignerCertificate.Subject.Split(',')[0] + ')' } elseif ($sig.Status -eq 'NotSigned') { 'なし' } else { [string]$sig.Status })"
         } catch {}
@@ -946,6 +973,8 @@ function Show-ItemDetail {
     if ($it.Kind -eq 'Folder') { $lines += "ファイル: $($it.FilePath)" }
     if ($it.Kind -eq 'Task')   { $lines += "タスク: $($it.TaskPath)$($it.TaskName)" }
     if ($it.Kind -eq 'Uwp')    { $lines += "パッケージ: $($it.Command)"; $lines += "※ ストアアプリは有効化/無効化のみ対応 (削除はアンインストールで)" }
+    $hint = Get-SensitiveHint $it
+    if ($hint) { $lines += ''; $lines += "⚠ $hint" }
     [System.Windows.Forms.MessageBox]::Show(($lines -join "`r`n"), '詳細 - ' + $it.Name) | Out-Null
 }
 
@@ -1059,7 +1088,8 @@ $form.Add_KeyDown({
             ''
             '■ 便利機能'
             '  ・「サードパーティのみ」= Microsoft/Windows標準を隠して掃除対象を絞る'
-            '  ・行をダブルクリック → 詳細 (発行元/署名/無効化日時など)'
+            '  ・重要そうな項目(セキュリティ/ドライバー/同期)は削除前に注意が出ます'
+            '  ・行をダブルクリック → 詳細 (発行元/署名/更新日時/注意など)'
             '  ・右クリック → 場所を開く / Webで検索 / 無効・リンク切れの一括選択'
             '  ・exeを一覧にドラッグ&ドロップ → 新規追加'
             '  ・赤字の行 = 実行ファイルが見つからない項目 (削除候補)'
@@ -1247,8 +1277,19 @@ $btnRemove.Add_Click({
     $sel = Get-SelectedItems
     if ($sel.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('対象を一覧から選択してください。','完全削除') | Out-Null; return }
     $names = ($sel | ForEach-Object { '・' + $_.Name }) -join "`r`n"
+    # 重要そうな項目には、削除前にやさしく注意する (影響を平易に)
+    $cautions = @()
+    foreach ($it in $sel) {
+        $h = Get-SensitiveHint $it
+        if ($h) { $cautions += ('・{0}: {1}' -f $it.Name, $h) }
+    }
+    $cautionBlock = ''
+    if ($cautions.Count -gt 0) {
+        $cautionBlock = "`r`n`r`n⚠ 次の項目は重要かもしれません:`r`n" + ($cautions -join "`r`n") +
+                        "`r`n`r`n迷うときは、まず『無効化』(あとで戻せます)をおすすめします。"
+    }
     $r = [System.Windows.Forms.MessageBox]::Show(
-        "次の項目を起動項目から完全に削除します。`r`n（削除前に自動でバックアップを作成します）`r`n`r`n$names`r`n`r`nよろしいですか?",
+        "次の項目を起動項目から完全に削除します。`r`n（削除前に自動でバックアップを作成します）`r`n`r`n$names$cautionBlock`r`n`r`nよろしいですか?",
         '完全削除の確認',
         [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Warning)
